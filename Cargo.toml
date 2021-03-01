@@ -21,7 +21,6 @@ bon = { path = "../pi_lib/bon" }
 worker = { path = "../pi_lib/worker" }
 handler = { path = "../pi_lib/handler" }
 atom = { path = "../pi_lib/atom" }
-apm = { path = "../pi_lib/apm" }
 file = { path = "../pi_lib/file" }
 gray = {path = "../pi_lib/gray" }
 guid = {path = "../pi_lib/guid" }
