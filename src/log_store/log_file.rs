@@ -803,7 +803,7 @@ impl LogFile {
                             //合并指定日志文件的日志块完成，并继续合并下一个只读日志文件
                             for buf in bufs {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
-                                match tmp_file.write(0, Arc::from(buf), WriteOptions::None).await {
+                                match tmp_file.write(0, buf, WriteOptions::None).await {
                                     Err(e) => {
                                         return Err(Error::new(ErrorKind::Other, format!("Write tmp log block failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
                                     },
@@ -820,7 +820,7 @@ impl LogFile {
                 //将合并后的日志块的头写入临时整理文件
                 let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
                 write_header(&mut header, hasher, total_size);
-                match tmp_file.write(0, Arc::from(header), WriteOptions::Sync(true)).await {
+                match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
                     Err(e) => {
                         self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                         return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
@@ -959,7 +959,7 @@ impl LogFile {
                             //合并指定日志文件的日志块完成，并继续合并下一个只读日志文件
                             for buf in bufs {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
-                                match tmp_file.write(0, Arc::from(buf), WriteOptions::None).await {
+                                match tmp_file.write(0, buf, WriteOptions::None).await {
                                     Err(e) => {
                                         return Err(Error::new(ErrorKind::Other, format!("Write tmp log block failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
                                     },
@@ -976,7 +976,7 @@ impl LogFile {
                 //将合并后的日志块的头写入临时整理文件
                 let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
                 write_header(&mut header, hasher, total_size);
-                match tmp_file.write(0, Arc::from(header), WriteOptions::Sync(true)).await {
+                match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
                     Err(e) => {
                         self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                         return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
