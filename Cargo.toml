@@ -8,12 +8,13 @@ edition = "2018"
 json = "0.11.13"
 log = "0.4"
 crc = "*"
-bytes = "0.5"
+bytes = "1.0"
 lazy_static = "*"
 fnv = "1.0.3"
 tempdir = "0.3"
 rand = "*"
-crossbeam-channel = "0.4"
+crossbeam-channel = "0.5"
+flume = "0.10"
 hash_value = { path = "../pi_math/hash_value" }
 bon = { path = "../pi_lib/bon" }
 worker = { path = "../pi_lib/worker" }

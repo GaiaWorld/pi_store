@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 use fastcmp::Compare;
 
 use r#async::{lock::mutex_lock::Mutex,
-              rt::multi_thread::{MultiTaskPool, MultiTaskRuntime}};
+              rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
 use hash::XHashMap;
 
 use pi_store::log_store::log_file::{PairLoader, LogMethod, LogFile, read_log_file, read_log_file_block};
@@ -46,8 +46,8 @@ impl Drop for Counter {
 
 #[test]
 fn test_log_append() {
-    let pool = MultiTaskPool::new("Test-Log-Append".to_string(), 8, 1024 * 1024, 10, None);
-    let rt = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -84,8 +84,8 @@ fn test_log_append() {
 
 #[test]
 fn test_log_remove() {
-    let pool = MultiTaskPool::new("Test-Log-Remove".to_string(), 8, 1024 * 1024, 10, None);
-    let rt = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -163,8 +163,8 @@ impl TestCache {
 
 #[test]
 fn test_log_load() {
-    let pool = MultiTaskPool::new("Test-Log-Load".to_string(), 8, 1024 * 1024, 10, None);
-    let rt = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -196,8 +196,8 @@ fn test_log_load() {
 
 #[test]
 fn test_log_collect() {
-    let pool = MultiTaskPool::new("Test-Log-Load".to_string(), 8, 1024 * 1024, 10, None);
-    let rt = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -228,8 +228,8 @@ fn test_log_collect() {
 
 #[test]
 fn test_log_append_delay_commit() {
-    let pool = MultiTaskPool::new("Test-Log-Commit".to_string(), 8, 2 * 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -250,7 +250,7 @@ fn test_log_append_delay_commit() {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
-                        if let Err(e) = log_copy.delay_commit(uid, false, 0).await {
+                        if let Err(e) = log_copy.delay_commit(uid, false, 1).await {
                             println!("!!!!!!commit log failed, e: {:?}", e);
                         } else {
                             counter_copy.0.fetch_add(1, Ordering::Relaxed);
@@ -266,8 +266,8 @@ fn test_log_append_delay_commit() {
 
 #[test]
 fn test_log_remove_delay_commit() {
-    let pool = MultiTaskPool::new("Test-Log-Commit".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -288,7 +288,7 @@ fn test_log_remove_delay_commit() {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::Remove, key.as_slice(), value);
-                        if let Err(e) = log_copy.delay_commit(uid, false, 20).await {
+                        if let Err(e) = log_copy.delay_commit(uid, false, 1).await {
                             println!("!!!!!!commit log failed, e: {:?}", e);
                         } else {
                             counter_copy.0.fetch_add(1, Ordering::Relaxed);
@@ -304,8 +304,8 @@ fn test_log_remove_delay_commit() {
 
 #[test]
 fn test_log_append_delay_commit_by_split() {
-    let pool = MultiTaskPool::new("Test-Log-Commit".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -326,7 +326,7 @@ fn test_log_append_delay_commit_by_split() {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
-                        if let Err(e) = log_copy.delay_commit(uid, true, 20).await {
+                        if let Err(e) = log_copy.delay_commit(uid, true, 1).await {
                             println!("!!!!!!commit log failed, e: {:?}", e);
                         } else {
                             counter_copy.0.fetch_add(1, Ordering::Relaxed);
@@ -342,8 +342,8 @@ fn test_log_append_delay_commit_by_split() {
 
 #[test]
 fn test_log_remove_delay_commit_by_split() {
-    let pool = MultiTaskPool::new("Test-Log-Commit".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -364,7 +364,7 @@ fn test_log_remove_delay_commit_by_split() {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::Remove, key.as_slice(), value);
-                        if let Err(e) = log_copy.delay_commit(uid, true, 20).await {
+                        if let Err(e) = log_copy.delay_commit(uid, true, 1).await {
                             println!("!!!!!!commit log failed, e: {:?}", e);
                         } else {
                             counter_copy.0.fetch_add(1, Ordering::Relaxed);
@@ -380,8 +380,8 @@ fn test_log_remove_delay_commit_by_split() {
 
 #[test]
 fn test_log_split() {
-    let pool = MultiTaskPool::new("Test-Log-Commit".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(true);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
@@ -421,7 +421,7 @@ fn test_log_split() {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
-                        if let Err(e) = log_copy.delay_commit(uid, false, 20).await {
+                        if let Err(e) = log_copy.delay_commit(uid, false, 1).await {
                             println!("!!!!!!commit log failed, e: {:?}", e);
                         } else {
                             counter_copy.0.fetch_add(1, Ordering::Relaxed);
@@ -449,8 +449,8 @@ fn test_log_split() {
 
 #[test]
 fn test_log_collect_logs() {
-    let pool = MultiTaskPool::new("Test-Log-Load".to_string(), 8, 1024 * 1024, 10, Some(10));
-    let rt = pool.startup(false);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {

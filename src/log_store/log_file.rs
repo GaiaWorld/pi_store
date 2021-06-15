@@ -13,6 +13,7 @@ use bytes::{Buf, BufMut};
 use crc32fast::Hasher;
 use fastcmp::Compare;
 use crossbeam_channel::{Sender, Receiver, unbounded};
+use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
 use log::{error, warn, debug};
 
 use r#async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
@@ -561,11 +562,18 @@ impl LogFile {
                 //检查当前日志块是否已达大小限制
                 if !(&mut *lock).0.as_ref().unwrap().is_size_limit(self.0.current_limit) {
                     //当前日志块未达同步大小限制，则等待日志块提交完成
-                    let r = AsyncValue::new(AsyncRuntime::Multi(self.0.rt.clone()));
-                    (&mut *mutex).push_back(r.clone());
+                    let (sender, receiver) = async_bounded(1);
+                    (&mut *mutex).push_back(sender);
                     drop(lock); //释放日志块锁
                     drop(mutex); //释放提交锁
-                    return r.await;
+                    match receiver.recv_async().await {
+                        Err(e) => {
+                            return Err(Error::new(ErrorKind::Other, format!("Commit log failed, path: {:?}, reason: {:?}", self.0.path, e)));
+                        },
+                        Ok(r) => {
+                            return r;
+                        },
+                    }
                 } else {
                     //当前日志块已达提交大小限制，则交换出当前日志块
                     commit_block = (&mut *lock).0.take();
@@ -585,8 +593,8 @@ impl LogFile {
                 let waits = (&mut *mutex);
                 for _ in 0..waits.len() {
                     //唤醒所有等待提交完成的任务
-                    if let Some(r) = waits.pop_front() {
-                        r.set(Ok(()));
+                    if let Some(sender) = waits.pop_front() {
+                        sender.send_async(Ok(())).await;
                     }
                 }
 
@@ -604,8 +612,8 @@ impl LogFile {
                         let waits = (&mut *mutex);
                         for _ in 0..waits.len() {
                             //唤醒所有等待同步完成的任务
-                            if let Some(r) = waits.pop_front() {
-                                r.set(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e))));
+                            if let Some(sender) = waits.pop_front() {
+                                sender.send_async(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)))).await;
                             }
                         }
 
@@ -617,8 +625,8 @@ impl LogFile {
                         let waits = (&mut *mutex);
                         for _ in 0..waits.len() {
                             //唤醒所有等待提交完成的任务
-                            if let Some(r) = waits.pop_front() {
-                                r.set(Ok(()));
+                            if let Some(sender) = waits.pop_front() {
+                                sender.send_async(Ok(())).await;
                             }
                         }
 
@@ -1474,7 +1482,7 @@ fn read_block_payload<P: AsRef<Path>>(list: &mut LinkedList<(LogMethod, Vec<u8>,
                                       is_checksum: bool) -> Result<()> {
     let bytes = &bin[payload_offset as usize..payload_offset as usize + payload_len as usize];
     let mut hasher = Hasher::new();
-    let mut payload = Cursor::new(bytes).to_bytes();
+    let mut payload = Cursor::new(bytes).copy_to_bytes(bytes.len());
     hasher.update(payload.as_ref());
     hasher.update(&payload_time.to_le_bytes());
 
@@ -1739,19 +1747,19 @@ async fn merge_block_log(map: &mut XHashMap<Arc<Vec<u8>>, ()>,
 * 内部日志文件
 */
 struct InnerLogFile {
-    rt:                 MultiTaskRuntime<()>,                               //日志文件异步运行时
-    path:               PathBuf,                                            //日志文件的本地路径
-    size_limit:         usize,                                              //日志文件大小软限制，单位字节
-    log_id:             AtomicUsize,                                        //本地可写日志唯一id
-    writable_len:       AtomicUsize,                                        //本地可写日志文件大小
-    writable:           AtomicPtr<Option<(PathBuf, AsyncFile<()>)>>,        //本地可写日志文件
-    readable:           AtomicPtr<Vec<(PathBuf, AsyncFile<()>)>>,           //本地只读日志文件列表
-    current_limit:      usize,                                              //日志文件的当前块大小软限制，单位字节
-    current:            SpinLock<(Option<LogBlock>, usize)>,                //日志文件的当前块
-    delay_commit:       AtomicBool,                                         //日志文件延迟提交状态
-    commited_uid:       AtomicUsize,                                        //日志文件最近提交成功的最大日志id
-    commit_lock:        Mutex<VecDeque<AsyncValue<(), Result<()>>>>,        //日志文件提交锁
-    mutex_status:       AtomicBool,                                         //日志文件是否正在执行互斥操作，例如日志整理或创建新的可写日志文件是互斥操作
+    rt:                 MultiTaskRuntime<()>,                           //日志文件异步运行时
+    path:               PathBuf,                                        //日志文件的本地路径
+    size_limit:         usize,                                          //日志文件大小软限制，单位字节
+    log_id:             AtomicUsize,                                    //本地可写日志唯一id
+    writable_len:       AtomicUsize,                                    //本地可写日志文件大小
+    writable:           AtomicPtr<Option<(PathBuf, AsyncFile<()>)>>,    //本地可写日志文件
+    readable:           AtomicPtr<Vec<(PathBuf, AsyncFile<()>)>>,       //本地只读日志文件列表
+    current_limit:      usize,                                          //日志文件的当前块大小软限制，单位字节
+    current:            SpinLock<(Option<LogBlock>, usize)>,            //日志文件的当前块
+    delay_commit:       AtomicBool,                                     //日志文件延迟提交状态
+    commited_uid:       AtomicUsize,                                    //日志文件最近提交成功的最大日志id
+    commit_lock:        Mutex<VecDeque<AsyncSender<Result<()>>>>,       //日志文件提交锁
+    mutex_status:       AtomicBool,                                     //日志文件是否正在执行互斥操作，例如日志整理或创建新的可写日志文件是互斥操作
 }
 
 unsafe impl Send for InnerLogFile {}
