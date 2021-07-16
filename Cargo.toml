@@ -17,10 +17,8 @@ crossbeam-channel = "0.5"
 flume = "0.10"
 hash_value = { path = "../pi_math/hash_value" }
 bon = { path = "../pi_lib/bon" }
-worker = { path = "../pi_lib/worker" }
 handler = { path = "../pi_lib/handler" }
 atom = { path = "../pi_lib/atom" }
-apm = { path = "../pi_lib/apm" }
 gray = {path = "../pi_lib/gray" }
 guid = {path = "../pi_lib/guid" }
 util = {path = "../pi_lib/util" }
