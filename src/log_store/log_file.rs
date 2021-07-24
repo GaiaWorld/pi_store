@@ -330,20 +330,6 @@ impl LogFile {
         unsafe { (&*self.0.readable.load(Ordering::Relaxed)).len() }
     }
 
-    //获取只读日志文件的大小，单位字节
-    pub fn readable_size(&self) -> u64 {
-        let mut size = 0;
-        unsafe {
-            let files = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
-            for (_, file) in files.iter() {
-                size += file.get_size();
-            }
-            Box::into_raw(files); //避免被回收
-        }
-
-        size
-    }
-
     //获取当前可写日志文件大小，单位字节
     pub fn writable_size(&self) -> usize {
         self.0.writable_len.load(Ordering::Relaxed)
@@ -440,7 +426,9 @@ impl LogFile {
                             let (last_log_path, last_log_file) = log_files.pop().unwrap();
                             let writable_len = AtomicUsize::new(last_log_file.get_size() as usize); //设置当前可写日志文件大小
                             let writable = AtomicPtr::new(Box::into_raw(Box::new(Some((last_log_path, last_log_file)))));
-                            let readable = AtomicPtr::new(Box::into_raw(Box::new(log_files)));
+                            let (readable_log_files_path, _readable_log_files)
+                                = log_files.into_iter().unzip::<_, _, Vec<PathBuf>, Vec<AsyncFile<()>>>(); //获取只读日志文件的路径列表，并释放所有只读日志文件的句柄
+                            let readable = AtomicPtr::new(Box::into_raw(Box::new(readable_log_files_path)));
                             let current = SpinLock::new((Some(LogBlock::new(block_size_limit)), DEFAULT_INIT_LOG_UID));
                             let commit_lock = Mutex::new(VecDeque::new());
                             let inner = InnerLogFile {
@@ -649,10 +637,10 @@ impl LogFile {
                                     Ok((new_writable_path, new_writable)) => {
                                         //追加新的可写日志文件成功
                                         unsafe {
-                                            if let Some((last_writable_path, last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
-                                                //将当前可写日志文件追加到只读日志文件列表中
+                                            if let Some((last_writable_path, _last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
+                                                //将当前可写日志文件路径追加到只读日志文件路径列表中，并释放当前可写日志文件的句柄
                                                 (&mut *self.0.readable.load(Ordering::Relaxed))
-                                                    .push((last_writable_path, last_writable));
+                                                    .push(last_writable_path);
                                             }
 
                                             *self.0.writable.load(Ordering::Relaxed) = Some((new_writable_path, new_writable)); //替换当前可写日志文件
@@ -722,10 +710,10 @@ impl LogFile {
                 Ok((new_writable_path, new_writable)) => {
                     //追加新的可写日志文件成功
                     unsafe {
-                        if let Some((last_writable_path, last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
-                            //将当前可写日志文件追加到只读日志文件列表中
+                        if let Some((last_writable_path, _last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
+                            //将当前可写日志文件的路径追加到只读日志文件路径列表中，并释放当前可写日志文件的句柄
                             (&mut *self.0.readable.load(Ordering::Relaxed))
-                                .push((last_writable_path, last_writable));
+                                .push(last_writable_path);
                         }
 
                         *self.0.writable.load(Ordering::Relaxed) = Some((new_writable_path, new_writable)); //替换当前可写日志文件
@@ -770,7 +758,7 @@ impl LogFile {
         }
 
         //获取最后的只读日志文件路径
-        let (last_readable_path, _) = unsafe { &(&*readable_box)[readable_len - 1] };
+        let last_readable_path = unsafe { &(&*readable_box)[readable_len - 1] };
         let last_readable_path = last_readable_path.clone();
         Box::into_raw(readable_box); //避免被回收
 
@@ -1207,11 +1195,11 @@ fn log_file_name_to_usize(name: &str) -> Option<usize> {
 
 //根据文件路径获取日志文件的序号
 fn get_log_index(log_path: Option<&PathBuf>,
-                 readable: &Vec<(PathBuf, AsyncFile<()>)>) -> Option<usize> {
+                 readable: &Vec<PathBuf>) -> Option<usize> {
     if let Some(path) = log_path {
         //指定了文件路径
         let mut index = 0; //初始偏移
-        for (p, _) in readable {
+        for p in readable {
             if p.canonicalize().unwrap() == path.canonicalize().unwrap() {
                 //标准化后，路径相同则立即返回偏移
                 return Some(index);
@@ -1229,10 +1217,10 @@ fn get_log_index(log_path: Option<&PathBuf>,
 //根据序号获取日志文件的路径
 fn get_log_path(index: Option<usize>,
                 writable: &Option<(PathBuf, AsyncFile<()>)>,
-                readable: &Vec<(PathBuf, AsyncFile<()>)>) -> Option<PathBuf> {
+                readable: &Vec<PathBuf>) -> Option<PathBuf> {
     if let Some(index) = index {
         //返回只读日志文件的路径
-        if let Some((readable_path, _)) = readable.get(index) {
+        if let Some(readable_path) = readable.get(index) {
             Some(readable_path.clone())
         } else {
             None
@@ -1262,12 +1250,22 @@ async fn load_file<C: PairLoader>(log_file: &LogFile,
         //读取指定的只读日志文件
         unsafe {
             let readable = Box::from_raw(log_file.0.readable.load(Ordering::Relaxed));
-            let r = (&*readable).get(log_index).unwrap().clone();
+            let readable_path = (&*readable).get(log_index).unwrap().clone();
             Box::into_raw(readable); //避免被回收
-            r
+
+            match AsyncFile::open(log_file.0.rt.clone(), readable_path.clone(), AsyncFileOptions::OnlyRead).await {
+                Err(e) => {
+                    //打开指定的只读日志文件失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other, format!("Load log file failed, file: {:?}, reason: {:?}", readable_path, e)));
+                },
+                Ok(readable_file) => {
+                    //打开指定的只读日志文件成功
+                    (readable_path, readable_file)
+                },
+            }
         }
     } else {
-        //读取当前可写日志文件
+        //读取当前可写日志文件的路径和文件句柄
         unsafe {
             let writable = Box::from_raw(log_file.0.writable.load(Ordering::Relaxed));
             let r = (&*writable).as_ref().unwrap().clone();
@@ -1576,9 +1574,19 @@ async fn merge_block(log_file: &LogFile,
         //读取指定的只读日志文件
         unsafe {
             let readable = Box::from_raw(log_file.0.readable.load(Ordering::Relaxed));
-            let r = (&*readable).get(log_index).unwrap().clone();
+            let readable_path = (&*readable).get(log_index).unwrap().clone();
             Box::into_raw(readable); //避免被回收
-            r
+
+            match AsyncFile::open(log_file.0.rt.clone(), readable_path.clone(), AsyncFileOptions::OnlyRead).await {
+                Err(e) => {
+                    //打开指定的只读日志文件失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other, format!("Merge log file block failed, file: {:?}, reason: {:?}", readable_path, e)));
+                },
+                Ok(readable_file) => {
+                    //打开指定的只读日志文件成功
+                    (readable_path, readable_file)
+                },
+            }
         }
     } else {
         //读取当前可写日志文件
@@ -1753,7 +1761,7 @@ struct InnerLogFile {
     log_id:             AtomicUsize,                                    //本地可写日志唯一id
     writable_len:       AtomicUsize,                                    //本地可写日志文件大小
     writable:           AtomicPtr<Option<(PathBuf, AsyncFile<()>)>>,    //本地可写日志文件
-    readable:           AtomicPtr<Vec<(PathBuf, AsyncFile<()>)>>,       //本地只读日志文件列表
+    readable:           AtomicPtr<Vec<PathBuf>>,                        //本地只读日志文件路径列表
     current_limit:      usize,                                          //日志文件的当前块大小软限制，单位字节
     current:            SpinLock<(Option<LogBlock>, usize)>,            //日志文件的当前块
     delay_commit:       AtomicBool,                                     //日志文件延迟提交状态
