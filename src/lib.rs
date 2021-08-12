@@ -6,4 +6,4 @@ extern crate lazy_static;
 extern crate log;
 
 pub mod log_store;
-pub mod log_file_db;
+pub mod commit_logger;

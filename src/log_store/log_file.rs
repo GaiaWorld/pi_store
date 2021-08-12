@@ -9,10 +9,10 @@ use std::collections::{LinkedList, VecDeque};
 use std::io::{Error, Result, ErrorKind, Cursor};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+use futures::future::{FutureExt, BoxFuture};
 use bytes::{Buf, BufMut};
 use crc32fast::Hasher;
 use fastcmp::Compare;
-use crossbeam_channel::{Sender, Receiver, unbounded};
 use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
 use log::{error, warn, debug};
 
@@ -29,7 +29,7 @@ const DEFAULT_LOG_BLOCK_HEADER_LEN: usize = 16;
 /*
 * 默认的日志文件名宽度
 */
-const DEFAULT_LOG_FILE_NAME_WIDTH: usize = 6;
+const DEFAULT_LOG_FILE_NAME_WIDTH: usize = 9;
 
 /*
 * 默认的初始日志文件数字
@@ -69,7 +69,7 @@ const MIN_LOG_FILE_SIZE_LIMIT: usize = 1024 * 1024;
 /*
 * 最大日志文件大小限制，16GB
 */
-const MAX_LOG_FILE_SIZE_LIMIT: usize = 16 * 1024 * 1024 * 1024;
+const MAX_LOG_FILE_SIZE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 
 /*
 * 默认的日志文件大小限制，16MB
@@ -330,7 +330,20 @@ impl LogFile {
         unsafe { (&*self.0.readable.load(Ordering::Relaxed)).len() }
     }
 
-    //获取当前可写日志文件大小，单位字节
+    //获取日志文件的当前可写文件的路径
+    pub fn writable_path(&self) -> Option<PathBuf> {
+        let writable = unsafe { Box::from_raw(self.0.writable.load(Ordering::Relaxed)) };
+        let result = if let Some((writable_path, _writable_file)) = &*writable {
+            Some(writable_path.clone())
+        } else {
+            None
+        };
+        Box::into_raw(writable); //避免提前释放
+
+        result
+    }
+
+    //获取日志文件的当前可写文件大小，单位字节
     pub fn writable_size(&self) -> usize {
         self.0.writable_len.load(Ordering::Relaxed)
     }
@@ -372,7 +385,7 @@ impl LogFile {
             block_size_limit = DEFAULT_LOG_BLOCK_SIZE_LIMIT;
         }
 
-        if log_size_limit < MIN_LOG_FILE_SIZE_LIMIT || log_size_limit > MAX_LOG_FILE_SIZE_LIMIT {
+        if log_size_limit < MIN_LOG_FILE_SIZE_LIMIT || log_size_limit as u64 > MAX_LOG_FILE_SIZE_LIMIT {
             //无效的日志文件大小限制，则设置为默认日志文件大小限制
             log_size_limit = DEFAULT_LOG_FILE_SIZE_LIMIT;
         }
@@ -530,13 +543,23 @@ impl LogFile {
     pub async fn commit(&self,
                         mut log_uid: usize,
                         is_forcibly: bool,
-                        is_split: bool) -> Result<()> {
+                        is_split: bool,
+                        timeout: Option<usize>) -> Result<()> {
         let mut commit_block = None;
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
 
-        if log_uid as usize <= self.0.commited_uid.load(Ordering::Relaxed) {
+        if log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
             //指定的日志已提交，则立即返回提交成功，也不需要唤醒任何的等待提交完成的任务
             return Ok(());
+        }
+
+        if let Some(timeout) = timeout {
+            //本次提交需要等待，当前正在进行的指定时间后的延迟提交
+            if !self.0.delay_commit.load(Ordering::Relaxed) {
+                //等待的当前延迟提交已完成，则继续等待下次延迟提交的返回
+                drop(mutex); //释放提交锁
+                return self.delay_commit(log_uid, is_split, timeout).await;
+            }
         }
 
         //日志块锁临界区
@@ -569,9 +592,7 @@ impl LogFile {
                 }
             }
 
-            //如果有延迟提交，则设置为无延迟提交
             log_uid = (*lock).1; //重置为当前提交时当前块的最大日志id
-            self.0.delay_commit.store(false, Ordering::Relaxed);
         }
 
         if let Some(block) = commit_block {
@@ -579,12 +600,16 @@ impl LogFile {
             if block.len() == 0 && !is_split {
                 //没有需要提交的日志块且不需要强制分裂，则立即返回成功
                 let waits = (&mut *mutex);
-                for _ in 0..waits.len() {
-                    //唤醒所有等待提交完成的任务
-                    if let Some(sender) = waits.pop_front() {
-                        sender.send_async(Ok(())).await;
-                    }
+                //唤醒所有等待提交完成的任务
+                while let Some(sender) = waits.pop_front() {
+                    sender.send_async(Ok(())).await;
                 }
+
+                //如果有延迟提交，则设置为无延迟提交
+                self.0.delay_commit.compare_exchange(true,
+                                                     false,
+                                                     Ordering::Acquire,
+                                                     Ordering::Relaxed);
 
                 return Ok(());
             }
@@ -598,24 +623,26 @@ impl LogFile {
                     Err(e) => {
                         //同步日志块失败，则立即返回错误
                         let waits = (&mut *mutex);
-                        for _ in 0..waits.len() {
-                            //唤醒所有等待同步完成的任务
-                            if let Some(sender) = waits.pop_front() {
-                                sender.send_async(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)))).await;
-                            }
+                        //唤醒所有等待同步完成的任务
+                        while let Some(sender) = waits.pop_front() {
+                            sender.send_async(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)))).await;
                         }
-
                         Box::into_raw(async_file); //避免被释放
+
+                        //如果有延迟提交，则设置为无延迟提交
+                        self.0.delay_commit.compare_exchange(true,
+                                                             false,
+                                                             Ordering::Acquire,
+                                                             Ordering::Relaxed);
+
                         return Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                     },
                     Ok(len) => {
                         //提交日志块成功
                         let waits = (&mut *mutex);
-                        for _ in 0..waits.len() {
-                            //唤醒所有等待提交完成的任务
-                            if let Some(sender) = waits.pop_front() {
-                                sender.send_async(Ok(())).await;
-                            }
+                        //唤醒所有等待提交完成的任务
+                        while let Some(sender) = waits.pop_front() {
+                            sender.send_async(Ok(())).await;
                         }
 
                         if self.0.mutex_status.compare_exchange(false,
@@ -660,33 +687,42 @@ impl LogFile {
             }
         }
 
+        //如果有延迟提交，则设置为无延迟提交
+        self.0.delay_commit.compare_exchange(true,
+                                             false,
+                                             Ordering::Acquire,
+                                             Ordering::Relaxed);
         self.0.commited_uid.store(log_uid, Ordering::Relaxed); //更新已提交完成的日志id
         Ok(())
     }
 
     //延迟提交，返回延迟提交是否成功
-    pub async fn delay_commit(&self,
-                              log_uid: usize,
-                              is_split: bool,
-                              timeout: usize) -> Result<()> {
-        if self.0.delay_commit.compare_exchange(false,
-                                                true,
-                                                Ordering::Acquire,
-                                                Ordering::Relaxed).is_err() {
-            //已经有延迟提交，则立即返回失败
-            return self.commit(log_uid, false, is_split).await
-        }
-
-        let rt = self.0.rt.clone();
+    pub fn delay_commit(&self,
+                        log_uid: usize,
+                        is_split: bool,
+                        timeout: usize) -> BoxFuture<Result<()>> {
         let log = self.clone();
-        self.0.rt.spawn(self.0.rt.alloc(), async move {
-            rt.wait_timeout(timeout).await; //延迟指定时间
-            log.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
-            if let Err(e) = log.commit(log_uid, true, is_split).await {
-                error!("Delay commit failed, log_uid: {:?}, timeout: {:?}, reason: {:?}", log_uid, timeout, e);
+
+        async move {
+            if log.0.delay_commit.compare_exchange(false,
+                                                    true,
+                                                    Ordering::Acquire,
+                                                    Ordering::Relaxed).is_err() {
+                //已经有延迟提交，则立即返回失败
+                return log.commit(log_uid, false, is_split, Some(timeout)).await;
             }
-        });
-        return self.commit(log_uid, false, is_split).await
+
+            let rt = self.0.rt.clone();
+            let log_copy = log.clone();
+            self.0.rt.spawn(self.0.rt.alloc(), async move {
+                rt.wait_timeout(timeout).await; //延迟指定时间
+                log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
+                if let Err(e) = log_copy.commit(log_uid, true, is_split, None).await {
+                    error!("Delay commit failed, log_uid: {:?}, timeout: {:?}, reason: {:?}", log_uid, timeout, e);
+                }
+            });
+            return log.commit(log_uid, false, is_split, Some(timeout)).await;
+        }.boxed()
     }
 
     //立即分裂当前的日志文件
