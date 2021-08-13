@@ -325,6 +325,11 @@ unsafe impl Sync for LogFile {}
 * 日志文件同步方法
 */
 impl LogFile {
+    //获取日志文件所在目录的路径
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+
     //获取只读日志文件数量
     pub fn readable_amount(&self) -> usize {
         unsafe { (&*self.0.readable.load(Ordering::Relaxed)).len() }
