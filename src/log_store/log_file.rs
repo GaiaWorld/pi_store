@@ -335,6 +335,22 @@ impl LogFile {
         unsafe { (&*self.0.readable.load(Ordering::Relaxed)).len() }
     }
 
+    //获取最近的只读日志文件路径
+    pub fn last_readable_path(&self) -> PathBuf {
+        unsafe {
+            let readables = &*self.0.readable.load(Ordering::Relaxed);
+            readables[readables.len() - 1].to_path_buf()
+        }
+    }
+
+    //获取所有的只读日志文件路径
+    pub fn all_readable_path(&self) -> Vec<PathBuf> {
+        unsafe {
+            let readables = &*self.0.readable.load(Ordering::Relaxed);
+            readables.clone()
+        }
+    }
+
     //获取日志文件的当前可写文件的路径
     pub fn writable_path(&self) -> Option<PathBuf> {
         let writable = unsafe { Box::from_raw(self.0.writable.load(Ordering::Relaxed)) };
@@ -768,6 +784,18 @@ impl LogFile {
         } else {
             //当前有整理与分裂冲突，则立即返回错误
             Err(Error::new(ErrorKind::WouldBlock, format!("Split log file failed, path: {:?}, reason: collect conflict", self.0.path)))
+        }
+    }
+
+    //将最近的只读日志文件修改为备份的只读日志文件
+    pub async fn last_readable_to_back(&self) -> Result<()> {
+        let last_readable_path = self.last_readable_path();
+        let mut back_readable_path = last_readable_path.clone();
+        if back_readable_path.set_extension(DEFAULT_BAK_LOG_FILE_EXT) {
+            //设置扩展名成功，则开始修改
+            rename(self.0.rt.clone(), last_readable_path.clone(), back_readable_path.clone()).await
+        } else {
+            Err(Error::new(ErrorKind::Other, format!("From last readable to back readable failed, last_readable_path: {:?}, back_readable_path: {:?}, reason: set extension error", last_readable_path, back_readable_path)))
         }
     }
 

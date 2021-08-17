@@ -18,7 +18,7 @@ use crate::log_store::log_file::{LogMethod, LogFile};
 ///
 /// 默认的提交日志的文件大小，为了防止自动生成新的可写文件，所以默认为最大
 ///
-const DEFAULT_COMMIT_LOG_FILE_SIZE: usize = usize::MAX;
+const DEFAULT_COMMIT_LOG_FILE_SIZE: usize = 16 * 1024 * 1024 * 1024;
 
 ///
 /// 默认的提交日志的块大小，单位B
@@ -172,7 +172,10 @@ impl AsyncCommitLog for CommitLogger {
             }
 
             //提交日志记录的检查点已清空，则立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
-            let _ = self.0.file.split().await;
+            if let Ok(_) = self.0.file.split().await {
+                //生成新的可写文件成功，则将上一个可写文件设置为备份的只读文件，并立即返回
+                return self.0.file.last_readable_to_back().await;
+            }
 
             Ok(())
         }.boxed()
