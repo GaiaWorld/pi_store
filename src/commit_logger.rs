@@ -13,7 +13,8 @@ use r#async::{lock::{mutex_lock::Mutex,
               rt::multi_thread::MultiTaskRuntime};
 use async_transaction::AsyncCommitLog;
 
-use crate::log_store::log_file::{LogMethod, LogFile};
+use crate::log_store::log_file::{PairLoader, LogMethod, LogFile};
+use std::convert::TryInto;
 
 ///
 /// 默认的提交日志的文件大小，为了防止自动生成新的可写文件，所以默认为最大
@@ -34,6 +35,11 @@ const DEFAULT_DELAY_COMMIT_TIMEOUT: usize = 1;
 /// 默认的整理检查点的间隔时长，单位ms
 ///
 const DEFAULT_COLLECT_INTERVAL: usize = 5 * 60 * 1000;
+
+///
+/// 默认的提交日志的加载缓冲区，单位B
+///
+const DEFAULT_LOAD_BUFFER_LEN: u64 = 8 * 1024 * 1024;
 
 ///
 /// 基于日志文件的提交日志记录器的构建器
@@ -180,6 +186,41 @@ impl AsyncCommitLog for CommitLogger {
             Ok(())
         }.boxed()
     }
+
+    fn replay<B, F>(&self, mut callback: F) -> BoxFuture<Result<(usize, usize)>>
+        where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+              F: FnMut(Self::Cid, B) -> Result<()> + Send + 'static {
+        let commit_logger = self.clone();
+
+        async move {
+            let mut loader = CommitLoggerLoader {
+                buf: Vec::new(),
+            };
+
+            if let Err(e) = commit_logger.0.file.load(&mut loader,
+                                                      None,
+                                                      DEFAULT_LOAD_BUFFER_LEN,
+                                                      true).await {
+                //加载提交日志错误，则立即返回错误原因
+                return Err(e);
+            }
+
+            //从提交日志的加载缓冲的栈顶开始强出所有待重播的提交日志，并同步执行重播回调
+            let mut log_len = 0; //记录数量
+            let mut bytes_len = 0; //记录字节大小
+            while let Some((commit_uid, log)) = loader.buf.pop() {
+                log_len += 1;
+                bytes_len += 16 + log.len();
+
+                if let Err(e) = callback(commit_uid.clone(), B::from(log)) {
+                    //执行重播回调失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other, format!("Replay commit log failed, commit_uid: {:?}, reason: {:?}", commit_uid, e)));
+                }
+            }
+
+            Ok((log_len, bytes_len))
+        }.boxed()
+    }
 }
 
 // 基于日志文件的内部提交日志记录器
@@ -188,6 +229,30 @@ struct InnerCommitLogger {
     file:               LogFile,                        //日志文件
     delay_timeout:      usize,                          //延迟刷新提交日志的时间，单位毫秒
     check_points:       Mutex<XHashMap<Guid, usize>>,   //提交日志记录器的检查点表
+}
+
+// 提交日志加载器
+struct CommitLoggerLoader {
+    buf:    Vec<(Guid, Vec<u8>)>,   //提交日志缓冲
+}
+
+impl PairLoader for CommitLoggerLoader {
+    fn is_require(&self, _log_file: Option<&PathBuf>, _key: &Vec<u8>) -> bool {
+        //提交日志的所有日志都需要加载
+        true
+    }
+
+    fn load(&mut self,
+            _log_file: Option<&PathBuf>,
+            _method: LogMethod,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>) {
+        let uid = u128::from_le_bytes(key.try_into().unwrap());
+        let commit_uid = Guid(uid);
+        if let Some(log) = value {
+            self.buf.push((commit_uid, log));
+        }
+    }
 }
 
 
