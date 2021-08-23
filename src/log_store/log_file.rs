@@ -492,7 +492,9 @@ impl LogFile {
         }
     }
 
-    //加载日志文件的内容到指定缓存，可以指定只读日志文件的路径，需要合并日志
+    //从后往前加载日志文件的内容到指定缓存，
+    //可以指定从只读日志文件开始往前加载，不指定则从当前可写日志文件开始往前加载
+    //因为需要合并日志，所以日志文件内还是从文件尾开始往前加载日志块
     pub async fn load<C: PairLoader>(&self,
                                      cache: &mut C,
                                      path: Option<PathBuf>,
@@ -501,8 +503,8 @@ impl LogFile {
         let log_index = unsafe { get_log_index(path.as_ref(), &*self.0.readable.load(Ordering::Relaxed)) };
         let mut offset = None;
 
-        //加载当前可写日志文件的内容
         if log_index.is_none() {
+            //首先加载可写日志文件的内容
             if let Err(e) = load_file(self,
                                       cache,
                                       None,
@@ -514,7 +516,7 @@ impl LogFile {
             }
         }
 
-        //加载只读日志文件的内容
+        //从后往前加载其它只读日志文件的内容
         let readable_box = unsafe { Box::from_raw(self.0.readable.load(Ordering::Relaxed)) };
         let len = (&*readable_box).len();
         Box::into_raw(readable_box); //避免被提前释放
@@ -555,6 +557,78 @@ impl LogFile {
                 //加载指定日志文件的指定二进制块失败，则立即返回错误
                 return Err(e);
             }
+        }
+
+        Ok(())
+    }
+
+    //从前往后加载日志文件的内容到指定缓存，
+    //可以指定从只读日志文件开始往后加载，不指定则从第一个只读日志文件开始往后加载
+    //注意日志文件内还是从文件尾开始往前加载日志块
+    pub async fn load_before<C: PairLoader>(&self,
+                                            cache: &mut C,
+                                            path: Option<PathBuf>,
+                                            buf_len: u64,
+                                            is_checksum: bool) -> Result<()> {
+        let log_index = unsafe { get_log_index_before(path.as_ref(), &*self.0.readable.load(Ordering::Relaxed)) };
+        let mut offset = None;
+
+        if log_index.is_none() {
+            //只需要加载可写日志文件，则忽略其它只读日志文件的加载，并立即结束本次加载
+            if let Err(e) = load_file(self,
+                                      cache,
+                                      None,
+                                      offset,
+                                      buf_len,
+                                      is_checksum).await {
+                //读可写日志文件的指定二进制块失败，则立即返回错误
+                return Err(e);
+            }
+
+            return Ok(());
+        }
+
+        //从指定只读日志文件开始，往后加载只读日志文件
+        let readable_box = unsafe { Box::from_raw(self.0.readable.load(Ordering::Relaxed)) };
+        let len = (&*readable_box).len();
+        Box::into_raw(readable_box); //避免被提前释放
+
+        let mut indexes = Vec::new();
+        if let Some(mut i) = log_index {
+            if i >= len {
+                //当序号大于等于只读日志文件数量，则加载所有只读日志文件
+                for index in 0..len {
+                    indexes.push(index);
+                }
+            } else {
+                //否则从指定的只读日志文件开始往后加载其它的只读日志文件
+                for index in i..len {
+                    indexes.push(index);
+                }
+            }
+        }
+
+        for index in indexes {
+            if let Err(e) = load_file(self,
+                                      cache,
+                                      Some(index),
+                                      offset,
+                                      buf_len,
+                                      is_checksum).await {
+                //加载指定日志文件的指定二进制块失败，则立即返回错误
+                return Err(e);
+            }
+        }
+
+        //最后加载可写日志文件的内容
+        if let Err(e) = load_file(self,
+                                  cache,
+                                  None,
+                                  offset,
+                                  buf_len,
+                                  is_checksum).await {
+            //读可写日志文件的指定二进制块失败，则立即返回错误
+            return Err(e);
         }
 
         Ok(())
@@ -797,6 +871,27 @@ impl LogFile {
         } else {
             Err(Error::new(ErrorKind::Other, format!("From last readable to back readable failed, last_readable_path: {:?}, back_readable_path: {:?}, reason: set extension error", last_readable_path, back_readable_path)))
         }
+    }
+
+    //将指定的只读日志文件路径修改为备份的只读日志文件
+    pub async fn readable_to_back(&self, readable_path: PathBuf) -> Result<()> {
+        let mut back_readable_path = readable_path.clone();
+        if back_readable_path.set_extension(DEFAULT_BAK_LOG_FILE_EXT) {
+            //设置扩展名成功，则开始修改
+            rename(self.0.rt.clone(), readable_path.clone(), back_readable_path.clone()).await
+        } else {
+            Err(Error::new(ErrorKind::Other, format!("From readable to back readable failed, readable_path: {:?}, back_readable_path: {:?}, reason: set extension error", readable_path, back_readable_path)))
+        }
+    }
+
+    //将所有只读日志文件路径修改为备份的只读日志文件
+    pub async fn all_readable_to_back(&self) -> Result<()> {
+        let paths = self.all_readable_path();
+        for path in paths {
+            let _ = self.readable_to_back(path).await?;
+        }
+
+        Ok(())
     }
 
     //整理只读日志文件，成功后返回整理文件的大小和日志数量
@@ -1262,7 +1357,7 @@ fn log_file_name_to_usize(name: &str) -> Option<usize> {
     None
 }
 
-//根据文件路径获取日志文件的序号
+//根据文件路径获取只读日志文件的序号
 fn get_log_index(log_path: Option<&PathBuf>,
                  readable: &Vec<PathBuf>) -> Option<usize> {
     if let Some(path) = log_path {
@@ -1279,8 +1374,35 @@ fn get_log_index(log_path: Option<&PathBuf>,
         }
     }
 
-    //没有指定文件路径或指定的文件路径不存在，则立即返回空
+    //没有指定文件路径或指定的文件路径不存在，则立即返回空，即表示可写日志文件
     None
+}
+
+//根据文件路径获取只读日志文件的序号
+fn get_log_index_before(log_path: Option<&PathBuf>,
+                        readable: &Vec<PathBuf>) -> Option<usize> {
+    if let Some(path) = log_path {
+        //指定了文件路径
+        let mut index = 0; //初始偏移
+        for p in readable {
+            if p.canonicalize().unwrap() == path.canonicalize().unwrap() {
+                //标准化后，路径相同则立即返回偏移
+                return Some(index);
+            }
+
+            //标准化后，路径不同，则继续
+            index += 1;
+        }
+    }
+
+    //没有指定文件路径或指定的文件路径不存在
+    if readable.len() > 0 {
+        //如果存在只读日志文件，则返回第一个只读日志文件的序号
+        Some(0)
+    } else {
+        //如果不存在只读日志文件，则返回空，即表示可写日志文件
+        None
+    }
 }
 
 //根据序号获取日志文件的路径
