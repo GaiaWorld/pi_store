@@ -5,5 +5,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate log;
 
+pub mod free_lock;
 pub mod log_store;
+pub mod vpm;
 pub mod commit_logger;
