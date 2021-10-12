@@ -1779,8 +1779,8 @@ struct NonLeaf<
     K: Ord + Debug + Clone + Send + 'static,
     V: Debug + Clone + Send + 'static,
 > {
-    b:      usize,                      //块系数
-    pairs:  VecDeque<KeyChildPair<K, V>>,    //键子对列表
+    b:      usize,                          //块系数
+    pairs:  VecDeque<KeyChildPair<K, V>>,   //键子对列表
 }
 
 impl<

@@ -1185,7 +1185,7 @@ async fn open_logs<P: AsRef<Path> + Debug>(rt: &MultiTaskRuntime<()>,
                 match AsyncFile::open(rt.clone(), log_path.clone(), AsyncFileOptions::ReadAppend).await {
                     Err(e) => {
                         //打开日志文件失败，则立即返回错误
-                        return Err(Error::new(ErrorKind::Other, format!("Open log failed, path: {:?}, reason: invalid file", &log_path)));
+                        return Err(Error::new(ErrorKind::Other, format!("Open log failed, path: {:?}, reason: {:?}", &log_path, e)));
                     },
                     Ok(log) => {
                         //打开日志文件成功
