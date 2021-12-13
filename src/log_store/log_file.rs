@@ -243,7 +243,7 @@ impl LogBlock {
         self.buf.len() >= size_limit
     }
 
-    //追加日志内容，返回追加日志大小，结构: 1字节方法标记 + 2字节关键字长度 + 关键字 + 4字节值长度 + 值
+    //追加日志内容，返回追加日志大小
     pub fn append(&mut self, method: LogMethod, key: &[u8], value: &[u8]) {
         let buf = &mut self.buf;
         let hasher = &mut self.hasher;
@@ -282,7 +282,7 @@ fn calc_block_alloc_len(block_len: usize) -> usize {
     }
 }
 
-//将日志内容写入缓冲区
+//将日志内容写入缓冲区，结构: 1字节方法标记 + 2字节关键字长度 + 关键字 + 4字节值长度 + 值
 #[inline]
 fn write_buf(buf: &mut Vec<u8>, method: LogMethod, key: &[u8], value: &[u8]) {
     let key_len = key.len();
@@ -297,7 +297,7 @@ fn write_buf(buf: &mut Vec<u8>, method: LogMethod, key: &[u8], value: &[u8]) {
     }
 }
 
-//将日志头写入缓冲区
+//将日志头写入缓冲区，结构: 8字节时间戳 + 4字节日志块校验码 + 4字节日志块长度
 #[inline]
 fn write_header(buf: &mut Vec<u8>, mut hasher: Hasher, len: usize) {
     //填充当前系统时间，并更新校验码
@@ -510,8 +510,7 @@ impl LogFile {
                                       None,
                                       offset,
                                       buf_len,
-                                      is_checksum,
-                                      false).await {
+                                      is_checksum).await {
                 //读可写日志文件的指定二进制块失败，则立即返回错误
                 return Err(e);
             }
@@ -554,8 +553,7 @@ impl LogFile {
                                       Some(index),
                                       offset,
                                       buf_len,
-                                      is_checksum,
-                                      false).await {
+                                      is_checksum).await {
                 //加载指定日志文件的指定二进制块失败，则立即返回错误
                 return Err(e);
             }
@@ -582,8 +580,7 @@ impl LogFile {
                                       None,
                                       offset,
                                       buf_len,
-                                      is_checksum,
-                                      true).await {
+                                      is_checksum).await {
                 //读可写日志文件的指定二进制块失败，则立即返回错误
                 return Err(e);
             }
@@ -617,8 +614,7 @@ impl LogFile {
                                       Some(index),
                                       offset,
                                       buf_len,
-                                      is_checksum,
-                                      true).await {
+                                      is_checksum).await {
                 //加载指定日志文件的指定二进制块失败，则立即返回错误
                 return Err(e);
             }
@@ -630,8 +626,7 @@ impl LogFile {
                                   None,
                                   offset,
                                   buf_len,
-                                  is_checksum,
-                                  true).await {
+                                  is_checksum).await {
             //读可写日志文件的指定二进制块失败，则立即返回错误
             return Err(e);
         }
@@ -1431,14 +1426,13 @@ fn get_log_path(index: Option<usize>,
     }
 }
 
-//加载指定日志文件的日志块，合并相同关键字的日志
+//加载指定日志文件的日志块，从后到前的加载，则合并相同关键字的日志，从前向后的加载，则不需要合并相同关键字的日志
 async fn load_file<C: PairLoader>(log_file: &LogFile,
                                   cache: &mut C,
                                   log_index: Option<usize>,
                                   mut offset: Option<u64>,
                                   mut len: u64,
-                                  is_checksum: bool,
-                                  from_before_to_after: bool) -> Result<()> {
+                                  is_checksum: bool) -> Result<()> {
     if len < DEFAULT_LOG_BLOCK_HEADER_LEN as u64 {
         return Err(Error::new(ErrorKind::Other, format!("Load file failed, log index: {:?}, offset: {:?}, len: {:?}, checksum: {:?}, reason: {:?}", log_index, offset, len, is_checksum, "Invalid len")));
     }
@@ -1482,8 +1476,7 @@ async fn load_file<C: PairLoader>(log_file: &LogFile,
                                           &bin,
                                           file_offset,
                                           len,
-                                          is_checksum,
-                                          from_before_to_after) {
+                                          is_checksum) {
                     Err(e) => return Err(e),
                     Ok((next_file_offset, next_len, logs)) => {
                         //读日志文件的指定缓冲区成功
@@ -1562,8 +1555,7 @@ pub fn read_log_file_block(file_path: PathBuf,
                            bin: &Vec<u8>,
                            file_offset: u64,
                            read_len: u64,
-                           is_checksum: bool,
-                           from_before_to_after: bool) -> Result<(u64, u64, LinkedList<(LogMethod, Vec<u8>, Option<Vec<u8>>)>)> {
+                           is_checksum: bool) -> Result<(u64, u64, LinkedList<(LogMethod, Vec<u8>, Option<Vec<u8>>)>)> {
     debug!("=====>file_path: {:?}, bin len: {}, file_offset: {}, read_len: {}", file_path, bin.len(), file_offset, read_len);
     let mut result = LinkedList::new();
     if bin.len() == 0 {
@@ -1591,8 +1583,7 @@ pub fn read_log_file_block(file_path: PathBuf,
                                                    payload_time,
                                                    payload_checksum,
                                                    payload_len,
-                                                   is_checksum,
-                                                   from_before_to_after) {
+                                                   is_checksum) {
                     //校验日志块负载失败，则立即返回错误
                     return Err(Error::new(ErrorKind::Other, format!("Valid failed for read log block, path: {:?}, file offset: {:?}, header offset: {:?}, reason: {:?}", file_path, file_offset, header_offset, e)));
                 }
@@ -1677,14 +1668,15 @@ fn read_block_payload<P: AsRef<Path>>(list: &mut LinkedList<(LogMethod, Vec<u8>,
                                       payload_time: u64,
                                       payload_checksum: u32,
                                       payload_len: u32,
-                                      is_checksum: bool,
-                                      from_before_to_after: bool) -> Result<()> {
+                                      is_checksum: bool) -> Result<()> {
     let bytes = &bin[payload_offset as usize..payload_offset as usize + payload_len as usize];
     let mut hasher = Hasher::new();
     let mut payload = Cursor::new(bytes).copy_to_bytes(bytes.len());
     hasher.update(payload.as_ref());
     hasher.update(&payload_time.to_le_bytes());
 
+    //将当前块的日志写入缓冲栈中
+    let mut stack = Vec::new();
     while payload.len() > 0 {
         //解析日志方法和关键字
         let tag = LogMethod::with_tag(payload.get_u8());
@@ -1696,26 +1688,19 @@ fn read_block_payload<P: AsRef<Path>>(list: &mut LinkedList<(LogMethod, Vec<u8>,
         //解析值
         if let LogMethod::Remove = tag {
             //移除方法的日志，则忽略值解析，并继续解析下一个日志
-            if from_before_to_after {
-                //从前向后加载
-                list.push_back((tag, key, None));
-            } else {
-                //从后向前加载
-                list.push_front((tag, key, None));
-            }
+            stack.push((tag, key, None));
             continue;
         }
         let value_len = payload.get_u32_le() as usize;
         swap = payload.split_off(value_len);
         let value = payload.to_vec();
         payload = swap;
-        if from_before_to_after {
-            //从前向后加载
-            list.push_back((tag, key, Some(value)));
-        } else {
-            //从后向前加载
-            list.push_front((tag, key, Some(value)));
-        }
+        stack.push((tag, key, Some(value)));
+    }
+
+    //将日志从临时缓冲栈中弹出，并写入链表尾部
+    while let Some(log) = stack.pop() {
+        list.push_back(log);
     }
 
     if is_checksum {
@@ -1824,8 +1809,7 @@ async fn merge_block(log_file: &LogFile,
                                           &bin,
                                           file_offset,
                                           read_len,
-                                          is_checksum,
-                                          false) {
+                                          is_checksum) {
                     Err(e) => return Err(e),
                     Ok((next_file_offset, next_len, logs)) => {
                         //读日志文件的指定缓冲区成功
@@ -1905,8 +1889,7 @@ async fn merge_block_log(map: &mut XHashMap<Arc<Vec<u8>>, ()>,
                                           &bin,
                                           file_offset,
                                           read_len,
-                                          is_checksum,
-                                          false) {
+                                          is_checksum) {
                     Err(e) => return Err(e),
                     Ok((next_file_offset, next_len, logs)) => {
                         //读日志文件的指定缓冲区成功
