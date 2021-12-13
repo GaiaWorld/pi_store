@@ -1970,4 +1970,3 @@ struct InnerLogFile {
 
 unsafe impl Send for InnerLogFile {}
 unsafe impl Sync for InnerLogFile {}
-
