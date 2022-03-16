@@ -16,19 +16,19 @@ tempdir = "0.3"
 rand = "*"
 crossbeam-channel = "0.5"
 flume = "0.10"
-hash_value = { path = "../pi_math/hash_value" }
-bon = { path = "../pi_lib/bon" }
-handler = { path = "../pi_lib/handler" }
-atom = { path = "../pi_lib/atom" }
-gray = {path = "../pi_lib/gray" }
-guid = {path = "../pi_lib/guid" }
-util = {path = "../pi_lib/util" }
-sinfo = {path = "../pi_lib/sinfo" }
-timer = {path = "../pi_lib/timer" }
-ordmap = {path = "../pi_lib/ordmap" }
-hash = { path = "../pi_lib/hash" }
-async = { path = "../pi_lib/async" }
-async_file = { path = "../pi_lib/async_file" }
+pi_hash_value = "0.1"
+pi_bon = "0.1"
+pi_handler = "0.1"
+pi_atom = "0.1"
+pi_gray = "0.1"
+pi_guid = "0.1"
+pi_util = "0.1"
+pi_sinfo = "0.1"
+pi_timer = "0.1"
+pi_ordmap = "0.1"
+pi_hash = "0.1"
+pi_async = "0.1"
+pi_async_file = "0.1"
 crc32fast = "1.2"
 fastcmp = "1.0"
 num_cpus = "1.13.0"

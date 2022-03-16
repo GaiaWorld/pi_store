@@ -17,10 +17,10 @@ use crossbeam_channel::{Sender, Receiver, unbounded};
 use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
 use log::{error, warn, debug};
 
-use r#async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
+use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
               rt::{AsyncValue, AsyncRuntime, multi_thread::MultiTaskRuntime}};
-use async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
-use hash::XHashMap;
+use pi_async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
+use pi_hash::XHashMap;
 
 /*
 * 默认的日志文件块头长度
