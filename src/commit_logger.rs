@@ -9,12 +9,12 @@ use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use futures::future::{FutureExt, BoxFuture};
 use bytes::BufMut;
 
-use guid::Guid;
-use hash::XHashMap;
-use r#async::{lock::{spin_lock::SpinLock,
-                     mutex_lock::Mutex},
-              rt::multi_thread::MultiTaskRuntime};
-use async_transaction::AsyncCommitLog;
+use pi_guid::Guid;
+use pi_hash::XHashMap;
+use pi_async::{lock::{spin_lock::SpinLock,
+                      mutex_lock::Mutex},
+               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_transaction::AsyncCommitLog;
 
 use crate::log_store::log_file::{PairLoader, LogMethod, LogFile};
 
@@ -447,7 +447,7 @@ async fn new_check_point(logger: &CommitLogger,
 // 整理提交日志记录器，在重播时不允许整理
 async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
     //等待指定时长后，开始整理提交日志记录器
-    logger.0.rt.wait_timeout(timeout).await;
+    logger.0.rt.timeout(timeout).await;
 
     if logger.0.is_replaying.load(Ordering::Relaxed) {
         //如果提交日志记录器，当前正在重播，则忽略整理

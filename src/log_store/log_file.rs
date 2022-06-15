@@ -16,10 +16,10 @@ use fastcmp::Compare;
 use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
 use log::{error, warn, debug};
 
-use r#async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
-              rt::{AsyncValue, AsyncRuntime, multi_thread::MultiTaskRuntime}};
-use async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
-use hash::XHashMap;
+use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
+               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
+use pi_hash::XHashMap;
 
 /*
 * 默认的日志文件块头长度
@@ -243,7 +243,7 @@ impl LogBlock {
         self.buf.len() >= size_limit
     }
 
-    //追加日志内容，返回追加日志大小
+    //追加日志内容，返回追加日志大小，结构: 1字节方法标记 + 2字节关键字长度 + 关键字 + 4字节值长度 + 值
     pub fn append(&mut self, method: LogMethod, key: &[u8], value: &[u8]) {
         let buf = &mut self.buf;
         let hasher = &mut self.hasher;
@@ -810,7 +810,7 @@ impl LogFile {
             let rt = self.0.rt.clone();
             let log_copy = log.clone();
             self.0.rt.spawn(self.0.rt.alloc(), async move {
-                rt.wait_timeout(timeout).await; //延迟指定时间
+                rt.timeout(timeout).await; //延迟指定时间
                 log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
                 if let Err(e) = log_copy.commit(log_uid, true, is_split, None).await {
                     error!("Delay commit failed, log_uid: {:?}, timeout: {:?}, reason: {:?}", log_uid, timeout, e);
