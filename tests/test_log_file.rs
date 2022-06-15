@@ -9,8 +9,8 @@ use crc32fast::Hasher;
 use fastcmp::Compare;
 
 use pi_async::{lock::mutex_lock::Mutex,
-              rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
-use pi_hash::XHashMap;
+               rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
+use hash::XHashMap;
 
 use pi_store::log_store::log_file::{PairLoader, LogMethod, LogFile, read_log_file, read_log_file_block};
 use std::io::ErrorKind;
