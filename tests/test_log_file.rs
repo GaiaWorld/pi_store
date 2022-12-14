@@ -1,18 +1,23 @@
-use std::thread;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::collections::{VecDeque, BTreeMap};
-use std::time::{Instant, Duration};
-use std::sync::atomic::{AtomicUsize, Ordering, AtomicBool};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crc32fast::Hasher;
 use fastcmp::Compare;
 
-use pi_async::{lock::mutex_lock::Mutex,
-               rt::multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime}};
-use hash::XHashMap;
+use pi_async::prelude::AsyncRuntime;
+use pi_async::{
+    lock::mutex_lock::Mutex,
+    rt::multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
+};
 
-use pi_store::log_store::log_file::{PairLoader, LogMethod, LogFile, read_log_file, read_log_file_block};
+use pi_hash::XHashMap;
+use pi_store::log_store::log_file::{
+    read_log_file, read_log_file_block, LogFile, LogMethod, PairLoader,
+};
 use std::io::ErrorKind;
 
 #[test]
@@ -40,7 +45,11 @@ struct Counter(AtomicUsize, Instant);
 
 impl Drop for Counter {
     fn drop(&mut self) {
-        println!("!!!!!!drop counter, count: {:?}, time: {:?}", self.0.load(Ordering::Relaxed), Instant::now() - self.1);
+        println!(
+            "!!!!!!drop counter, count: {:?}, time: {:?}",
+            self.0.load(Ordering::Relaxed),
+            Instant::now() - self.1
+        );
     }
 }
 
@@ -121,9 +130,9 @@ fn test_log_remove() {
 }
 
 struct TestCache {
-    is_hidden_remove:   bool,
-    removed:            XHashMap<Vec<u8>, ()>,
-    map:                BTreeMap<Vec<u8>, Option<String>>,
+    is_hidden_remove: bool,
+    removed: XHashMap<Vec<u8>, ()>,
+    map: BTreeMap<Vec<u8>, Option<String>>,
 }
 
 impl PairLoader for TestCache {
@@ -131,10 +140,17 @@ impl PairLoader for TestCache {
         !self.removed.contains_key(key) && !self.map.contains_key(key)
     }
 
-    fn load(&mut self, log_file: Option<&PathBuf>, _method: LogMethod, key: Vec<u8>, value: Option<Vec<u8>>) {
+    fn load(
+        &mut self,
+        log_file: Option<&PathBuf>,
+        _method: LogMethod,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) {
         if let Some(value) = value {
             unsafe {
-                self.map.insert(key, Some(String::from_utf8_unchecked(value)));
+                self.map
+                    .insert(key, Some(String::from_utf8_unchecked(value)));
             }
         } else {
             if self.is_hidden_remove {
@@ -159,6 +175,42 @@ impl TestCache {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+}
+
+#[test]
+fn test_log_files() {
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(rt.alloc(), async move {
+        match LogFile::open(rt_copy.clone(), "./db/", 8000, 1024 * 1024, None).await {
+            Err(e) => {
+                println!("!!!!!!open log failed, e: {:?}", e);
+            }
+            Ok(log) => {
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                println!("第一次整理开始");
+                let r = log.split().await;
+                println!("第一次分裂文件 r:{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                let r = log.collect(1024 * 1024, 32 * 1024, false).await;
+                println!("整理返回::{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                println!("第一次整理完成");
+                println!("第二次整理开始");
+                let r = log.split().await;
+                println!("第二次分裂文件 r:{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                let r = log.collect(1024 * 1024, 32 * 1024, false).await;
+                println!("整理返回::{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                println!("第二次整理完成");
+            }
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
 }
 
 #[test]
@@ -201,23 +253,24 @@ fn test_log_collect() {
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
-        match LogFile::open(rt_copy.clone(),
-                            "./log",
-                            8000,
-                            1024 * 1024,
-                            None).await {
+        match LogFile::open(rt_copy.clone(), "./log", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
-            },
+            }
             Ok(log) => {
                 let start = Instant::now();
                 match log.collect(1024 * 1024, 32 * 1024, false).await {
                     Err(e) => {
                         println!("!!!!!!load log failed, e: {:?}", e);
-                    },
+                    }
                     Ok((size, len)) => {
-                        println!("!!!!!!load log ok, size: {:?}, len: {:?}, time: {:?}", size, len, Instant::now() - start);
-                    },
+                        println!(
+                            "!!!!!!load log ok, size: {:?}, len: {:?}, time: {:?}",
+                            size,
+                            len,
+                            Instant::now() - start
+                        );
+                    }
                 }
             }
         }
@@ -454,28 +507,29 @@ fn test_log_collect_logs() {
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
-        match LogFile::open(rt_copy.clone(),
-                            "./log",
-                            8000,
-                            1024 * 1024,
-                            None).await {
+        match LogFile::open(rt_copy.clone(), "./log", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
-            },
+            }
             Ok(log) => {
-                let log_paths = vec![
-                    PathBuf::from("./log/000001"),
-                    PathBuf::from("./log/000002"),
-                ];
+                let log_paths = vec![PathBuf::from("./log/000001"), PathBuf::from("./log/000002")];
 
                 let start = Instant::now();
-                match log.collect_logs(vec![], log_paths, 1024 * 1024, 32 * 1024, true).await {
+                match log
+                    .collect_logs(vec![], log_paths, 1024 * 1024, 32 * 1024, true)
+                    .await
+                {
                     Err(e) => {
                         println!("!!!!!!collect logs failed, e: {:?}", e);
-                    },
+                    }
                     Ok((size, len)) => {
-                        println!("!!!!!!collect logs ok, size: {:?}, len: {:?}, time: {:?}", size, len, Instant::now() - start);
-                    },
+                        println!(
+                            "!!!!!!collect logs ok, size: {:?}, len: {:?}, time: {:?}",
+                            size,
+                            len,
+                            Instant::now() - start
+                        );
+                    }
                 }
             }
         }

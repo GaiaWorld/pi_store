@@ -999,6 +999,13 @@ impl LogFile {
                             return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
                         }
 
+                        unsafe {
+                            //整理只读文件列表
+                            let readbles = &mut *self.0.readable.load(Ordering::Relaxed);
+                            readbles.clear();
+                            readbles.push(collected_path);
+                        }
+
                         //整理成功
                         self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                         Ok((total_size + size, total_len))
