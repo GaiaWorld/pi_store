@@ -262,7 +262,7 @@ impl LogBlock {
 }
 
 //获取当前系统时间，错误返回0，单位ms
-fn now_unix_epoch() -> u64 {
+pub fn now_unix_epoch() -> u64 {
     if let Ok(time) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
         return time.as_millis() as u64;
     }
@@ -1182,7 +1182,7 @@ impl LogFile {
 }
 
 //按顺序打开所有的日志文件，根据需要将所有被整理的日志文件更新为备份文件，并移除所有临时整理日志文件
-async fn open_logs<P: AsRef<Path> + Debug>(rt: &MultiTaskRuntime<()>,
+pub async fn open_logs<P: AsRef<Path> + Debug>(rt: &MultiTaskRuntime<()>,
                                            path: P) -> Result<(Vec<(PathBuf, AsyncFile<()>)>, Option<String>)> {
     match clean(rt, path).await {
         Err(e) => Err(e),
