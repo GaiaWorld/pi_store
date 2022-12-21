@@ -999,11 +999,12 @@ impl LogFile {
                             return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
                         }
 
+                        //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
                         unsafe {
-                            //整理只读文件列表
-                            let readbles = &mut *self.0.readable.load(Ordering::Relaxed);
-                            readbles.clear();
-                            readbles.push(collected_path);
+                            let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
+                            (&mut *readable_box).clear();
+                            (&mut *readable_box).push(collected_path);
+                            Box::into_raw(readable_box); //避免被回收
                         }
 
                         //整理成功
@@ -1051,7 +1052,7 @@ impl LogFile {
             match rename(self.0.rt.clone(), remove_path.clone(), bak_path.clone()).await {
                 Err(e) => {
                     //改名为备份日志文件失败，则立即返回错误
-                    return Err(Error::new(ErrorKind::Other, format!("Rename log to bak failed, from: {:?}, to: {:?}, reason: invalid file", remove_path, bak_path)));
+                    return Err(Error::new(ErrorKind::Other, format!("Rename log to bak failed, from: {:?}, to: {:?}, reason: {:?}", remove_path, bak_path, e)));
                 },
                 Ok(_) => {
                     //改名为备份日志文件成功，则逻辑移除只读日志文件成功，并继续逻辑移除下一个需要移除的只读日志文件
@@ -1160,6 +1161,14 @@ impl LogFile {
                             //清理整理后的日志文件目录失败，则立即返回错误
                             self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                             return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
+                        }
+
+                        //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
+                        unsafe {
+                            let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
+                            (&mut *readable_box).clear();
+                            (&mut *readable_box).push(collected_path);
+                            Box::into_raw(readable_box); //避免被回收
                         }
 
                         //整理成功

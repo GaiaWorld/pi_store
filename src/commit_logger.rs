@@ -243,7 +243,7 @@ impl AsyncCommitLog for CommitLogger {
                     if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
                         //当前已完成确认的检查点是当前可写检查点
                         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为已完成确认
-                        new_check_point(&logger, true);
+                        new_check_point(&logger, true).await;
                     }
 
                     //整理只读检查点的文件路径列表中已完成确认且可以移除的只读检查点

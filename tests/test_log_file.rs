@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 use crc32fast::Hasher;
 use fastcmp::Compare;
 
-use pi_async::prelude::AsyncRuntime;
 use pi_async::{
     lock::mutex_lock::Mutex,
-    rt::multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
+    rt::{AsyncRuntime, multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder}},
 };
 
 use pi_hash::XHashMap;
@@ -179,12 +178,14 @@ impl TestCache {
 
 #[test]
 fn test_log_files() {
+    env_logger::init();
+
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
-        match LogFile::open(rt_copy.clone(), "./db/", 8000, 1024 * 1024, None).await {
+        match LogFile::open(rt_copy.clone(), "./log/", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
             }
@@ -197,7 +198,8 @@ fn test_log_files() {
                 let r = log.collect(1024 * 1024, 32 * 1024, false).await;
                 println!("整理返回::{:?}", r);
                 println!("只读文件列表:{:?}", log.all_readable_path());
-                println!("第一次整理完成");
+                println!("第一次整理完成\n");
+
                 println!("第二次整理开始");
                 let r = log.split().await;
                 println!("第二次分裂文件 r:{:?}", r);
@@ -205,7 +207,16 @@ fn test_log_files() {
                 let r = log.collect(1024 * 1024, 32 * 1024, false).await;
                 println!("整理返回::{:?}", r);
                 println!("只读文件列表:{:?}", log.all_readable_path());
-                println!("第二次整理完成");
+                println!("第二次整理完成\n");
+
+                println!("第三次整理开始");
+                let r = log.split().await;
+                println!("第三次分裂文件 r:{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                let r = log.collect(1024 * 1024, 32 * 1024, false).await;
+                println!("整理返回::{:?}", r);
+                println!("只读文件列表:{:?}", log.all_readable_path());
+                println!("第三次整理完成\n");
             }
         }
     });
