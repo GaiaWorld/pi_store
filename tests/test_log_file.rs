@@ -18,6 +18,7 @@ use pi_hash::XHashMap;
 use pi_store::log_store::log_file::{
     read_log_file, read_log_file_block, LogFile, LogMethod, PairLoader,
 };
+use pi_store::log_store::repair_log_file::repair_log;
 use std::io::ErrorKind;
 
 #[test]
@@ -239,6 +240,27 @@ fn test_log_load() {
                         println!("!!!!!!load log ok, len: {:?}, time: {:?}", cache.len(), Instant::now() - start);
                     },
                 }
+            }
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 修复数据
+#[test]
+fn test_repair_log_file() {
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(rt.alloc(), async move {
+        match repair_log(&rt_copy, "./db", 32 * 1024).await {
+            Err(e) => {
+                println!("!!!!!test_repair_log_file, e: {:?}", e);
+            }
+            Ok(_) => {
+                println!("!!!!!!test_repair_log_file ok");
             }
         }
     });
