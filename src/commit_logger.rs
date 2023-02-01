@@ -201,7 +201,7 @@ impl AsyncCommitLog for CommitLogger {
 
             //注册本次事务到检查点表
             let (counter, path) = &*logger.0.writable.lock();
-            counter.fetch_add(1, Ordering::Relaxed); //增加可写检查点未确认事务的计数
+            counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
             check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
 
             Ok(log_handle)
@@ -238,7 +238,7 @@ impl AsyncCommitLog for CommitLogger {
 
             if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
                 //从检查点表中移除已确认的事务，并减少事务对应检查点的计数
-                if counter.fetch_sub(1, Ordering::Relaxed) == 1 {
+                if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
                     //当前已确认事务对应的检查点的计数已清空，则表示事务对应检查点的所有事务已完成确认
                     if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
                         //当前已完成确认的检查点是当前可写检查点
@@ -383,7 +383,7 @@ impl AsyncCommitLog for CommitLogger {
 
             //重播将忽略追加提交日志，但必须注册本次重播事务到检查点表
             let (counter, path) = &*logger.0.writable.lock();
-            counter.fetch_add(1, Ordering::Relaxed); //增加可写检查点未确认事务的计数
+            counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
             check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
 
             Ok(0)
