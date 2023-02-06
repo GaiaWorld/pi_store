@@ -54,6 +54,60 @@ impl Drop for Counter {
 }
 
 #[test]
+fn test_empty_value() {
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(rt.alloc(), async move {
+        match LogFile::open(rt_copy.clone(),
+                            "./log",
+                            8000,
+                            1024 * 1024,
+                            None).await {
+            Err(e) => {
+                println!("!!!!!!open log failed, e: {:?}", e);
+            },
+            Ok(log) => {
+                let rt_clone = rt_copy.clone();
+                rt_copy.spawn(rt_copy.alloc(), async move {
+                    let key = "Test001".to_string().into_bytes();
+                    let value = "".as_bytes();
+                    let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
+                    if let Err(e) = log.commit(uid, true, false, None).await {
+                        println!("!!!!!!append log failed, e: {:?}", e);
+                    }
+
+                    match LogFile::open(rt_clone.clone(),
+                                        "./log",
+                                        8000,
+                                        1024 * 1024,
+                                        None).await {
+                        Err(e) => {
+                            println!("!!!!!!open log failed, e: {:?}", e);
+                        },
+                        Ok(log_0) => {
+                            let mut cache = TestCache::new(true);
+                            let start = Instant::now();
+                            match log_0.load(&mut cache, None, 32 * 1024, true).await {
+                                Err(e) => {
+                                    println!("!!!!!!load log failed, e: {:?}", e);
+                                },
+                                Ok(_) => {
+                                    println!("!!!!!!load log ok, len: {:?}, time: {:?}", cache.len(), Instant::now() - start);
+                                },
+                            }
+                        },
+                    }
+                });
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
 fn test_log_append() {
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();

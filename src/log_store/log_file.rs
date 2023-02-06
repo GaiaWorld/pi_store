@@ -292,8 +292,12 @@ fn write_buf(buf: &mut Vec<u8>, method: LogMethod, key: &[u8], value: &[u8]) {
     buf.put_slice(&[method as u8, (key_len & 0xff) as u8, (key_len >> 8 & 0xff) as u8]); //写入方法标记1字节和关键字小端序2字节
     buf.put_slice(key); //写入关键字
     if value_len > 0 {
+        //非空值
         buf.put_u32_le(value_len as u32); //写入值长度
         buf.put_slice(value);  //写入值
+    } else {
+        //空值
+        buf.put_u32_le(0); //只写入值长度0
     }
 }
 
