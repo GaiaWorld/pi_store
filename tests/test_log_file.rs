@@ -74,6 +74,12 @@ fn test_empty_value() {
                     let key = "Test001".to_string().into_bytes();
                     let value = "".as_bytes();
                     let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
+                    let uid = log.append(LogMethod::Remove, key.as_slice(), value);
+                    let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
+                    let uid = log.append(LogMethod::Remove, key.as_slice(), value);
+                    let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
+                    let uid = log.append(LogMethod::Remove, key.as_slice(), value);
+                    let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
                     if let Err(e) = log.commit(uid, true, false, None).await {
                         println!("!!!!!!append log failed, e: {:?}", e);
                     }
