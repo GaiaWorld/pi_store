@@ -60,6 +60,7 @@ fn test_empty_value() {
 
     let rt_copy = rt.clone();
     rt.spawn(rt.alloc(), async move {
+        let start = Instant::now();
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -69,10 +70,14 @@ fn test_empty_value() {
                 println!("!!!!!!open log failed, e: {:?}", e);
             },
             Ok(log) => {
+                //打开指定的日志文件成功
+                println!("!!!!!!open log ok, time: {:?}", Instant::now() - start);
+
                 let rt_clone = rt_copy.clone();
                 rt_copy.spawn(rt_copy.alloc(), async move {
                     let key = "Test001".to_string().into_bytes();
                     let value = "".as_bytes();
+                    let start = Instant::now();
                     let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
                     let uid = log.append(LogMethod::Remove, key.as_slice(), value);
                     let uid = log.append(LogMethod::PlainAppend, key.as_slice(), value);
@@ -83,7 +88,9 @@ fn test_empty_value() {
                     if let Err(e) = log.commit(uid, true, false, None).await {
                         println!("!!!!!!append log failed, e: {:?}", e);
                     }
+                    println!("!!!!!!write log ok, time: {:?}", Instant::now() - start);
 
+                    let start = Instant::now();
                     match LogFile::open(rt_clone.clone(),
                                         "./log",
                                         8000,
@@ -93,6 +100,9 @@ fn test_empty_value() {
                             println!("!!!!!!open log failed, e: {:?}", e);
                         },
                         Ok(log_0) => {
+                            //打开指定的日志文件成功
+                            println!("!!!!!!open log ok, time: {:?}", Instant::now() - start);
+
                             let mut cache = TestCache::new(true);
                             let start = Instant::now();
                             match log_0.load(&mut cache, None, 32 * 1024, true).await {
@@ -100,7 +110,61 @@ fn test_empty_value() {
                                     println!("!!!!!!load log failed, e: {:?}", e);
                                 },
                                 Ok(_) => {
+                                    //加载指定的日志文件成功
                                     println!("!!!!!!load log ok, len: {:?}, time: {:?}", cache.len(), Instant::now() - start);
+
+                                    let start = Instant::now();
+                                    match log.split().await {
+                                        Err(e) => {
+                                            println!("!!!!!!split log failed, e: {:?}", e);
+                                        },
+                                        Ok(len) => {
+                                            //强制分裂日志文件成功
+                                            println!("!!!!!!split log ok, len: {:?}, time: {:?}", len, Instant::now() - start);
+
+                                            let start = Instant::now();
+                                            match log.collect(1024 * 1024, 32 * 1024, false).await {
+                                                Err(e) => {
+                                                    println!("!!!!!!collect log failed, e: {:?}", e);
+                                                }
+                                                Ok((size, len)) => {
+                                                    println!(
+                                                        "!!!!!!collect log ok, size: {:?}, len: {:?}, time: {:?}",
+                                                        size,
+                                                        len,
+                                                        Instant::now() - start
+                                                    );
+
+                                                    let start = Instant::now();
+                                                    match LogFile::open(rt_clone.clone(),
+                                                                        "./log",
+                                                                        8000,
+                                                                        1024 * 1024,
+                                                                        None).await {
+                                                        Err(e) => {
+                                                            println!("!!!!!!open log failed, e: {:?}", e);
+                                                        },
+                                                        Ok(log_0) => {
+                                                            //打开指定的日志文件成功
+                                                            println!("!!!!!!open log ok, time: {:?}", Instant::now() - start);
+
+                                                            let mut cache = TestCache::new(true);
+                                                            let start = Instant::now();
+                                                            match log_0.load(&mut cache, None, 32 * 1024, true).await {
+                                                                Err(e) => {
+                                                                    println!("!!!!!!load log failed, e: {:?}", e);
+                                                                },
+                                                                Ok(_) => {
+                                                                    //加载指定的日志文件成功
+                                                                    println!("!!!!!!load log ok, len: {:?}, time: {:?}", cache.len(), Instant::now() - start);
+                                                                },
+                                                            }
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    }
                                 },
                             }
                         },
