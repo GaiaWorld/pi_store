@@ -35,7 +35,7 @@ pi_hash = "0.1"
 crc32fast = "1.2"
 fastcmp = "1.0"
 num_cpus = "1.13.0"
-pi_assets = "0.11"
+pi_assets = "0.12"
 pi_share = "0.4"
 
 [dev-dependencies]

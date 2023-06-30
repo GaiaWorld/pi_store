@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use std::result::Result as GenResult;
 use std::cmp::Ordering as CmpOrdering;
 use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}};ets
 
 use futures::future::{FutureExt, BoxFuture};
 use dashmap::{DashMap, iter::Iter};
@@ -14,7 +14,7 @@ use log::{warn, debug};
 
 use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
                rt::{AsyncTaskPoolExt, AsyncTaskPool, AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder as PiMultiTaskRuntimeBuilder, MultiTaskRuntime}}};
-use pi_assets::{asset::{Asset, Garbageer, GarbageGuard},
+use pi_assets::{asset::{Asset, Size, Garbageer, GarbageGuard},
                 mgr::{AssetMgr, LoadResult},
                 allocator::Allocator};
 use pi_share::Share;
@@ -163,7 +163,15 @@ impl<
     P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
 > Asset for SharedPageBuffer<C, O, B, D, P> {
     type Key = u128;
+}
 
+impl<
+    C: Send + 'static,
+    O: Send + 'static,
+    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Clone + Send + Sync + 'static,
+    D: VirtualPageWriteDelta<Content = C>,
+    P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
+> Size for SharedPageBuffer<C, O, B, D, P> {
     fn size(&self) -> usize {
         self.0.buf_size()
     }
