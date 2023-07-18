@@ -1,28 +1,26 @@
-use std::mem;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::collections::btree_map::{Entry as BtreeMapEntry, BTreeMap};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use futures::FutureExt;
-use bytes::{Buf, BufMut};
+use async_lock::Mutex;
 use dashmap::{DashMap, mapref::entry::Entry};
-use log::{warn, debug};
+use bytes::BufMut;
+use log::debug;
 
-use pi_async::{lock::{spin_lock::SpinLock,
-                     mutex_lock::Mutex},
-              rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::rt::{AsyncRuntime,
+                      multi_thread::MultiTaskRuntime};
 use pi_guid::Guid;
 
 use crate::vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId, VirtualPageWriteCmd, WriteIndex,
                  page_cache::{VirtualPageLFUCache, VirtualPageLFUCacheDirtyIterator},
                  page_table::VirtualPageTable,
-                 page_pool::{VirtualPageCachingStrategy, VirtualPageBufferPool, PageBuffer},
-                 EMPTY_PAGE};
+                 page_pool::{VirtualPageCachingStrategy, VirtualPageBufferPool, PageBuffer}};
 use crate::devices::{EMPTY_BLOCK,
                      EMPTY_BLOCK_LOCATION,
                      DeviceDetail,
@@ -460,7 +458,7 @@ impl<
         //异步释放指定块设备的指定块
         let offset = page_id.device_offset();
         let devices = self.0.devices.clone();
-        self.0.rt.spawn(self.0.rt.alloc(), async move {
+        let _ = self.0.rt.spawn(async move {
             if let Some(device) = devices.get(&offset) {
                 //指定位置的块设备存在，则释放指定的块
                 device.free_block(&location).await;
@@ -900,7 +898,7 @@ impl<
                         return Err(Error::new(ErrorKind::Other, format!("Sync page failed, page_id: {:?}, reason: {:?}", page_id, e)));
                     },
                     Ok(size) => {
-                        mem::drop(sync_guard);
+                        drop(sync_guard);
                         size
                     },
                 };
@@ -1039,7 +1037,7 @@ impl<
                 return Err(Error::new(ErrorKind::Other, format!("Sync page buffer failed, page_id: {:?}, reason: {:?}", page_id, e)));
             },
             Ok(size) => {
-                mem::drop(sync_guard);
+                drop(sync_guard);
                 size
             },
         };
@@ -1311,7 +1309,7 @@ async fn flush_write_to_pages<C, O, B, D, P, I, M>(table: &VirtualPageTable,
                 let delta_size = delta.size();
                 buffer.append_delta(delta);
                 pool.adjust_page_buffer_size(copied_page_id.as_ref(), delta_size as isize);
-                mem::drop(flush_guard); //关闭页缓冲的刷新状态
+                drop(flush_guard); //关闭页缓冲的刷新状态
 
                 page_ids.push(*copied_page_id);
             },
@@ -1409,7 +1407,7 @@ async fn flush_followup_write_to_pages<C, O, B, D, P, I, M>(table: &VirtualPageT
                 let delta_size = delta.size();
                 buffer.append_delta(delta);
                 pool.adjust_page_buffer_size(copied_page_id.as_ref(), delta_size as isize);
-                mem::drop(flush_guard); //关闭页缓冲的刷新状态
+                drop(flush_guard); //关闭页缓冲的刷新状态
 
                 page_ids.push(*copied_page_id);
             },
@@ -1457,7 +1455,7 @@ async fn sync_all_dirty_pages<C, O, B, D, P, I, M, BU, BS, BK, BV, BD>(rt: &Mult
                               buffer.as_ref()).await {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 //分配块失败或写块数据失败，则忽略当前页缓冲的同步，并继续同步下一个页缓冲
-                mem::drop(sync_guard);
+                drop(sync_guard);
                 continue;
             },
             Err(e) => {
@@ -1466,7 +1464,7 @@ async fn sync_all_dirty_pages<C, O, B, D, P, I, M, BU, BS, BK, BV, BD>(rt: &Mult
             },
             Ok(buffer_size) => {
                 //同步指定的脏页缓冲成功
-                mem::drop(sync_guard);
+                drop(sync_guard);
                 count += 1; //增加本次同步的页缓冲数量
                 size += buffer_size; //增加本次同步的页缓冲大小
             },
@@ -1622,7 +1620,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                             .await
                             .get(&delta_cmd_index) {
                             //对应写指令编号的写指令存在
-                            write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, e)))).await;
+                            let _ = write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, e)))).await;
                         }
                     }
 
@@ -1649,7 +1647,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                         .await
                         .get(&delta_cmd_index) {
                         //对应写指令编号的写指令存在
-                        write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, e)))).await;
+                        let _ = write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, e)))).await;
                     }
                 }
 
@@ -1665,7 +1663,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                             .await
                             .get(&delta_cmd_index) {
                             //对应写指令编号的写指令存在
-                            write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, current_location: {}, old_location: {}, new_location: {}, reason: update location failed", copied_page_id, offset, delta_cmd_index, current_location, old_location, *new_location)))).await;
+                            let _ = write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, current_location: {}, old_location: {}, new_location: {}, reason: update location failed", copied_page_id, offset, delta_cmd_index, current_location, old_location, *new_location)))).await;
                         }
                     }
 
@@ -1681,7 +1679,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                             .await
                             .get(&delta_cmd_index) {
                             //对应写指令编号的写指令存在
-                            write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, old_location: {}, new_location: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, old_location, *new_location, e)))).await;
+                            let _ = write_cmd.callback_by_sync(Err(Error::new(ErrorKind::Other, format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, old_location: {}, new_location: {}, reason: {:?}", copied_page_id, offset, delta_cmd_index, old_location, *new_location, e)))).await;
                         }
                     }
 
@@ -1700,7 +1698,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                         .await
                         .get(&delta_cmd_index) {
                         //对应写指令编号的写指令存在，调用当前写指令的写增量的成功回调
-                        write_cmd.callback_by_sync(Ok(sync_count)).await;
+                        let _ = write_cmd.callback_by_sync(Ok(sync_count)).await;
 
                         if write_cmd.deltas_len() == 0 && write_cmd.followup_len() == 0 {
                             is_remove_cmd = true;

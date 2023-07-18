@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::sync::Arc;
 use std::mem::drop;
 use std::fmt::Debug;
@@ -10,14 +9,14 @@ use std::io::{Error, Result, ErrorKind, Cursor};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use futures::future::{FutureExt, BoxFuture};
+use async_channel::{Sender as AsyncSender, bounded as async_bounded};
+use async_lock::Mutex;
 use bytes::{Buf, BufMut};
 use crc32fast::Hasher;
-use fastcmp::Compare;
-use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
-use log::{error, warn, debug};
+use log::{error, debug};
 
-use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
-               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
 use pi_hash::XHashMap;
 
@@ -207,7 +206,7 @@ impl From<LogBlock> for Vec<u8> {
     fn from(block: LogBlock) -> Self {
         let LogBlock {
             mut buf,
-            mut hasher,
+            hasher,
         } = block;
 
         //检查二进制长度
@@ -680,7 +679,7 @@ impl LogFile {
                     (&mut *mutex).push_back(sender);
                     drop(lock); //释放日志块锁
                     drop(mutex); //释放提交锁
-                    match receiver.recv_async().await {
+                    match receiver.recv().await {
                         Err(e) => {
                             return Err(Error::new(ErrorKind::Other, format!("Commit log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                         },
@@ -705,14 +704,14 @@ impl LogFile {
                 let waits = (&mut *mutex);
                 //唤醒所有等待提交完成的任务
                 while let Some(sender) = waits.pop_front() {
-                    sender.send_async(Ok(())).await;
+                    let _ = sender.send(Ok(())).await;
                 }
 
                 //如果有延迟提交，则设置为无延迟提交
-                self.0.delay_commit.compare_exchange(true,
-                                                     false,
-                                                     Ordering::Acquire,
-                                                     Ordering::Relaxed);
+                let _ = self.0.delay_commit.compare_exchange(true,
+                                                             false,
+                                                             Ordering::Acquire,
+                                                             Ordering::Relaxed);
 
                 return Ok(());
             }
@@ -728,15 +727,17 @@ impl LogFile {
                         let waits = (&mut *mutex);
                         //唤醒所有等待同步完成的任务
                         while let Some(sender) = waits.pop_front() {
-                            sender.send_async(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)))).await;
+                            let _ = sender
+                                .send(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e))))
+                                .await;
                         }
                         Box::into_raw(async_file); //避免被释放
 
                         //如果有延迟提交，则设置为无延迟提交
-                        self.0.delay_commit.compare_exchange(true,
-                                                             false,
-                                                             Ordering::Acquire,
-                                                             Ordering::Relaxed);
+                        let _ = self.0.delay_commit.compare_exchange(true,
+                                                                     false,
+                                                                     Ordering::Acquire,
+                                                                     Ordering::Relaxed);
 
                         return Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                     },
@@ -745,7 +746,7 @@ impl LogFile {
                         let waits = (&mut *mutex);
                         //唤醒所有等待提交完成的任务
                         while let Some(sender) = waits.pop_front() {
-                            sender.send_async(Ok(())).await;
+                            let _ = sender.send(Ok(())).await;
                         }
 
                         if self.0.mutex_status.compare_exchange(false,
@@ -791,10 +792,10 @@ impl LogFile {
         }
 
         //如果有延迟提交，则设置为无延迟提交
-        self.0.delay_commit.compare_exchange(true,
-                                             false,
-                                             Ordering::Acquire,
-                                             Ordering::Relaxed);
+        let _ = self.0.delay_commit.compare_exchange(true,
+                                                     false,
+                                                     Ordering::Acquire,
+                                                     Ordering::Relaxed);
         self.0.commited_uid.store(log_uid, Ordering::Relaxed); //更新已提交完成的日志id
         Ok(())
     }
@@ -817,7 +818,7 @@ impl LogFile {
 
             let rt = self.0.rt.clone();
             let log_copy = log.clone();
-            self.0.rt.spawn(self.0.rt.alloc(), async move {
+            let _ = self.0.rt.spawn(async move {
                 rt.timeout(timeout).await; //延迟指定时间
                 log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
                 if let Err(e) = log_copy.commit(log_uid, true, is_split, None).await {
@@ -830,7 +831,7 @@ impl LogFile {
 
     //立即分裂当前的日志文件
     pub async fn split(&self) -> Result<usize> {
-        let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
+        let mut _mutex = self.0.commit_lock.lock().await; //获取提交锁
 
         if self.0.mutex_status.compare_exchange(false,
                                                 true,
@@ -1310,7 +1311,11 @@ async fn clean<P: AsRef<Path>>(rt: &MultiTaskRuntime<()>, path: P) -> Result<Vec
                         match rename(rt.clone(), log_path.clone(), bak_log_path.clone()).await {
                             Err(e) => {
                                 //改名为备份日志文件失败，则立即返回错误
-                                return Err(Error::new(ErrorKind::Other, format!("Rename log to bak failed, from: {:?}, to: {:?}, reason: invalid file", &log_path, &bak_log_path)));
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Rename log to bak failed, from: {:?}, to: {:?}, reason: {:?}",
+                                                              &log_path,
+                                                              &bak_log_path,
+                                                              e)));
                             },
                             Ok(_) => {
                                 //改名为备份日志文件成功，则忽略备份日志文件，并继续尝试打开下一个日志文件

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::hash::Hash;
-use std::io::{SeekFrom, Result};
+use std::io::Result;
 
 use futures::future::BoxFuture;
 use url::Url;

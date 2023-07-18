@@ -1,19 +1,15 @@
 use std::marker::PhantomData;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
-use std::result::Result as GenResult;
-use std::cmp::Ordering as CmpOrdering;
-use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering}};
-use std::sync::atomic::AtomicBool;
+use std::io::Result;
+use std::sync::{Arc,
+                atomic::{AtomicU64, AtomicUsize, Ordering}};
 
-use futures::future::{FutureExt, BoxFuture};
-use dashmap::{DashMap, iter::Iter};
-use bytes::{Buf, BufMut};
-use log::debug;
+use futures::future::BoxFuture;
+use async_lock::{Mutex, MutexGuard};
+use bytes::BufMut;
 
-use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::{Mutex, MutexGuard}},
-              rt::multi_thread::MultiTaskRuntime};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::multi_thread::MultiTaskRuntime};
 
 use crate::vpm::{VirtualPageWriteDelta, VirtualPageBuf};
 
@@ -481,7 +477,7 @@ impl<
 
     /// 设置页缓冲的状态为开始刷新，成功返回状态守护者
     #[inline]
-    pub async fn start_flush(&self) -> PageBufferStatusGuard {
+    pub async fn start_flush<'a>(&'a self) -> PageBufferStatusGuard<'a> {
         let mut locked = self.status.lock().await;
         match *locked {
             PAGE_INITED => {
@@ -497,7 +493,7 @@ impl<
 
     /// 设置页缓冲的状态为开始同步，成功返回空状态守护者
     #[inline]
-    pub async fn start_sync(&self) -> PageBufferStatusGuard {
+    pub async fn start_sync<'a>(&'a self) -> PageBufferStatusGuard<'a> {
         let mut locked = self.status.lock().await;
         match *locked {
             PAGE_INITED => {
@@ -515,9 +511,9 @@ impl<
 ///
 /// 页缓冲状态守护者
 ///
-pub struct PageBufferStatusGuard(MutexGuard<u8>);
+pub struct PageBufferStatusGuard<'a>(MutexGuard<'a, u8>);
 
-impl Drop for PageBufferStatusGuard {
+impl<'a> Drop for PageBufferStatusGuard<'a> {
     fn drop(&mut self) {
         //重置页缓冲的状态
         *self.0 = PAGE_INITED;

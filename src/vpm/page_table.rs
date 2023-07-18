@@ -1,22 +1,21 @@
-use std::mem;
 use std::time::Instant;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::result::Result as GenResult;
-use std::collections::{VecDeque, hash_map::Entry as HashMapEntry};
-use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+use std::collections::hash_map::Entry as HashMapEntry;
+use std::io::Result;
+use std::sync::{Arc,
+                atomic::{AtomicU64, Ordering}};
 
 use dashmap::{DashMap, iter::Iter};
-use bytes::BufMut;
 use log::{debug, error};
 
 use pi_hash::XHashMap;
-use pi_async::{lock::spin_lock::SpinLock,
+use pi_async_rt::{lock::spin_lock::SpinLock,
               rt::multi_thread::MultiTaskRuntime};
 
 use crate::{log_store::log_file::{PairLoader, LogMethod, LogFile},
-            vpm::{EMPTY_PAGE, PageId}};
+            vpm::EMPTY_PAGE};
 
 ///
 /// 可分配的最大页面唯一id
@@ -98,7 +97,7 @@ impl VirtualPageTable {
     pub fn alloc_page_uid(&self) -> u64 {
         let locked = self.0.wait_flush.lock();
         let page_uid = self.0.page_uid_allocator.fetch_add(1, Ordering::Relaxed);
-        mem::drop(locked);
+        drop(locked);
 
         if page_uid > MAX_PAGE_UID {
             //达到可分配的页面唯一id限制，则立即抛出异常

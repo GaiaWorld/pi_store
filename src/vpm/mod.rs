@@ -4,18 +4,15 @@ use std::io::{Error, Result as IOResult, ErrorKind};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::sync::atomic::AtomicU64;
 
-use dashmap::DashMap;
-use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
+use async_channel::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
 use bytes::{Buf, BufMut};
 
-use pi_async::lock::spin_lock::SpinLock;
+use pi_async_rt::lock::spin_lock::SpinLock;
 
 pub mod page_manager;
 pub mod page_pool;
 pub mod page_table;
 pub mod page_cache;
-
-use page_manager::VirtualPageManager;
 
 ///
 /// 虚拟页表中的空页，用于表示不存在或不可用的页，在持久化时用于描述虚拟页表的元信息所在的页
@@ -387,7 +384,7 @@ impl<
             }
         }
 
-        if let Err(e) = self.0.sender.send_async(result).await {
+        if let Err(e) = self.0.sender.send(result).await {
             return Err(format!("Callbak by sync failed, reason: {:?}", e));
         }
 
@@ -400,7 +397,7 @@ impl<
             match self
                 .0
                 .receiver
-                .recv_async()
+                .recv()
                 .await {
                 Err(e) => {
                     //等待写指令写操作完成失败，则立即返回错误原因
@@ -432,7 +429,7 @@ impl<
             match self
                 .0
                 .receiver
-                .recv_async()
+                .recv()
                 .await {
                 Err(e) => {
                     //等待写指令写操作完成失败，则立即返回错误原因

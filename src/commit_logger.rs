@@ -1,19 +1,19 @@
-use std::mem;
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::collections::{VecDeque, hash_map::Entry};
+use std::collections::VecDeque;
 use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{Arc,
+                atomic::{AtomicBool, AtomicU64, Ordering}};
 
 use futures::future::{FutureExt, BoxFuture};
+use async_lock::Mutex;
 use bytes::BufMut;
 
 use pi_guid::Guid;
 use pi_hash::XHashMap;
-use pi_async::{lock::{spin_lock::SpinLock,
-                      mutex_lock::Mutex},
-               rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::AsyncCommitLog;
 
 use crate::log_store::log_file::{PairLoader, LogMethod, LogFile};
@@ -156,7 +156,7 @@ impl CommitLoggerBuilder {
         //启动提交日志记录器的定时整理
         let commit_logger_copy = commit_logger.clone();
         let timeout = self.collect_interval;
-        rt.spawn(rt.alloc(), async move {
+        let _ = rt.spawn(async move {
             loop {
                 collect_commit_logger(&commit_logger_copy, timeout).await;
             }
@@ -464,7 +464,7 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
         new_check_point(&logger, false).await;
     }
 
-    mem::drop(check_pointes_locked); //立即释放检查点表的异步锁
+    drop(check_pointes_locked); //立即释放检查点表的异步锁
 }
 
 // 基于日志文件的内部提交日志记录器

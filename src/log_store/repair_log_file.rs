@@ -7,7 +7,7 @@ use bytes::Buf;
 use crc32fast::Hasher;
 use log::debug;
 
-use pi_async::rt::multi_thread::MultiTaskRuntime;
+use pi_async_rt::rt::multi_thread::MultiTaskRuntime;
 use pi_async_file::file::{rename, AsyncFile, AsyncFileOptions, WriteOptions};
 
 use crate::log_store::log_file::now_unix_epoch;

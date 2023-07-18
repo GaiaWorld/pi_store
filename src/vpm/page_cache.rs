@@ -1,19 +1,15 @@
+use std::sync::Arc;
 use std::ops::Deref;
 use std::marker::PhantomData;
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
-use std::result::Result as GenResult;
-use std::cmp::Ordering as CmpOrdering;
 use std::io::{Error, Result, ErrorKind};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering}};
 
 use futures::future::{FutureExt, BoxFuture};
-use dashmap::{DashMap, iter::Iter};
 use bytes::{Buf, BufMut};
-use log::{warn, debug};
+use log::warn;
 
-use pi_async::{lock::{spin_lock::SpinLock, mutex_lock::Mutex},
-               rt::{AsyncTaskPoolExt, AsyncTaskPool, AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder as PiMultiTaskRuntimeBuilder, MultiTaskRuntime}}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncTaskPoolExt, AsyncTaskPool, AsyncRuntime,
+                       multi_thread::MultiTaskRuntime}};
 use pi_assets::{asset::{Asset, Size, Garbageer, GarbageGuard},
                 mgr::{AssetMgr, LoadResult},
                 allocator::Allocator};
@@ -21,7 +17,8 @@ use pi_share::Share;
 use pi_hash::XHashMap;
 
 
-use crate::vpm::{VirtualPageWriteDelta, VirtualPageBuf, page_pool::{VirtualPageCachingStrategy, PageBuffer}, page_manager::VirtualPageManager, PageId};
+use crate::vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
+                 page_pool::{VirtualPageCachingStrategy, PageBuffer}};
 
 // 全局虚拟页LFU缓存分配器
 lazy_static! {
@@ -216,7 +213,7 @@ impl<
         let buffer = (*v).clone();
         if let Some(ptr) = *SHARED_PAGE_BUFFER_RELEASE_CALLBACK.lock() {
             //虚拟页的共享页缓冲释放回调存在
-            self.0.rt.spawn(self.0.rt.alloc(), async move {
+            let _ = self.0.rt.spawn(async move {
                 if buffer.deltas_len() > 0 {
                     //待释放的虚拟页是脏页，则需要立即强制同步
                     let boxed = unsafe {
@@ -402,12 +399,12 @@ impl<
                     match loading.await {
                         Err(e) if e.kind() == ErrorKind::NotFound => {
                             //指定的页不存在
-                            receiver.receive(page_id, Err(Error::new(e.kind(), format!("Load page buffer failed, page_id: {:?}, reason: {:?}", page_id, e)))).await; //通知异步加载失败
+                            let _ = receiver.receive(page_id, Err(Error::new(e.kind(), format!("Load page buffer failed, page_id: {:?}, reason: {:?}", page_id, e)))).await; //通知异步加载失败
                             Err(e)
                         },
                         Err(e) => {
                             //异步加载指定的页缓冲失败
-                            receiver.receive(page_id, Err(Error::new(e.kind(), format!("Async load page buffer failed, page_id: {:?}, reason: {:?}", page_id, e)))).await; //通知异步加载失败
+                            let _ = receiver.receive(page_id, Err(Error::new(e.kind(), format!("Async load page buffer failed, page_id: {:?}, reason: {:?}", page_id, e)))).await; //通知异步加载失败
                             Err(e)
                         },
                         Ok(buffer) => {
@@ -489,7 +486,7 @@ impl<
             let inner = InnerVirtualPageLFUCache {
                 mgr: mgr.clone(),
             };
-            Arc::into_raw(mgr); //避免提前释放
+            let _ = Arc::into_raw(mgr); //避免提前释放
 
             VirtualPageLFUCache(Arc::new(inner))
         } else {

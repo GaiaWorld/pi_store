@@ -1,11 +1,9 @@
 use std::ptr;
-use std::mem;
 use std::time::Instant;
 use std::hint::spin_loop;
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::collections::VecDeque;
-use std::ops::{Deref, DerefMut};
 use std::cmp::{Ord, PartialOrd, Eq, PartialEq, Ordering};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, AtomicPtr, Ordering as AtomicOrdering}};
 
@@ -252,7 +250,7 @@ impl<
                     //安全的修改树超时，则立即返回原关键字和值
                     return Err((key, value));
                 }
-                mem::drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
 
                 self.0.length.fetch_add(1, AtomicOrdering::Release);
                 Ok(None)
@@ -265,7 +263,7 @@ impl<
                     //安全的修改树超时，则立即返回原关键字和值
                     return Err((key, value));
                 }
-                mem::drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
 
                 Ok(Some(last_value))
             },
@@ -296,7 +294,7 @@ impl<
         match result {
             Err(_index) => {
                 //指定关键字的值不存在，则返回
-                mem::drop(shared_root); //保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //保证旧根节点在共享引用计数清0后释放
                 Ok(None)
             },
             Ok(_last_value) => {
@@ -307,7 +305,7 @@ impl<
                     //安全的修改树超时，则立即返回原关键字和值
                     return Err(key);
                 }
-                mem::drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
 
                 self.0.length.fetch_sub(1, AtomicOrdering::Release);
                 Ok(Some(last_value))
@@ -377,7 +375,7 @@ fn safety_borrow_root<K, V>(root: &AtomicPtr<Node<K, V>>, retry: u32) -> (*mut N
                 let shared_root = unsafe { Arc::from_raw(current_raw as *mut Node<K, V>) };
                 let shared_root_copy = shared_root.clone(); //复制当前根节点的共享引用
                 root.store(current_raw, AtomicOrdering::Release); //恢复被替换的当前根节点
-                Arc::into_raw(shared_root); //防止被提前释放
+                let _ = Arc::into_raw(shared_root); //防止被提前释放
                 return (raw, shared_root_copy);
             },
         }
@@ -735,7 +733,7 @@ fn try_split_leaf<K, V>(stack: &mut Vec<(Node<K, V>, usize)>,
     let (split_index, split_key) = get_leaf_split_key(leaf_mut);
     let new_pairs = leaf_mut.pairs.split_off(split_index); //分裂当前叶节点的键值对列表
     let new_leaf = Arc::new(Leaf::new(leaf_mut.b, new_pairs));
-    mem::drop(leaf_mut); //对当前叶节点的修改已完成，则立即释放当前叶节点的可写引用
+    drop(leaf_mut); //对当前叶节点的修改已完成，则立即释放当前叶节点的可写引用
 
     if stack.len() == 0 {
         //需要分裂的当前叶节点是根节点，则创建上级非叶节点作为新的根节点
@@ -812,7 +810,7 @@ fn try_split_non_leaf<K, V>(stack: &mut Vec<(Node<K, V>, usize)>,
     let old_min_pair = new_pairs.pop_front().unwrap(); //从新的键子对的头部弹出旧的最小键子对
     new_pairs.get_mut(0).unwrap().prev = old_min_pair.next; //将旧的最小键子对的后继子节点作为新的键子对的新的最小键子对的前趋子节点
     let new_non_leaf = Arc::new(NonLeaf::with_pairs(non_leaf_mut.b, new_pairs)); //构建新的非叶节点
-    mem::drop(non_leaf_mut); //对当前非叶节点的修改已完成，则立即释放当前非叶节点的可写引用
+    drop(non_leaf_mut); //对当前非叶节点的修改已完成，则立即释放当前非叶节点的可写引用
     let split_key_prev = Some(Node::NonLeaf(non_leaf.clone())); //创建分裂关键字的前趋子节点
     let split_key_next = Some(Node::NonLeaf(new_non_leaf)); //创建分裂关键字的后继子节点
 
@@ -1428,7 +1426,7 @@ impl<
                             self.length.load(AtomicOrdering::Acquire),
                             self.depth.load(AtomicOrdering::Acquire),
                             shared_root);
-        Arc::into_raw(shared_root); //避免提前释放
+        let _ = Arc::into_raw(shared_root); //避免提前释放
 
         result
     }

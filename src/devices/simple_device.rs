@@ -16,10 +16,9 @@ use crc32fast::Hasher;
 use log::error;
 
 use pi_guid::Guid;
-use pi_async::{lock::spin_lock::SpinLock,
-              rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_file::file::{AsyncFileOptions, AsyncFile, WriteOptions};
-use pi_sinfo::EnumType::Bin;
 
 use crate::devices::{DeviceType, DeviceValueType, DeviceDetailMap, DeviceStatus, DeviceStatistics, BlockDevice, BlockLocation, EMPTY_BLOCK_LOCATION};
 
@@ -353,8 +352,8 @@ impl BlockDevice for SimpleDevice {
                 }
 
                 //采集块分配的统计信息
-                sender0.send(1);
-                sender1.send(size as u128);
+                let _ = sender0.send(1);
+                let _ = sender1.send(size as u128);
 
                 //扩容当前文件大小成功，则立即返回分配的块地址
                 to_location(block_align_pos, block_align_count(block_align_size, self.block_unit_len))
@@ -396,8 +395,8 @@ impl BlockDevice for SimpleDevice {
                 },
                 Ok(mut bin) => {
                     //读取成功，则采集块读取的统计信息，并返回读取的块数据
-                    sender0.send(1);
-                    sender1.send(block_align_count as u128);
+                    let _ = sender0.send(1);
+                    let _ = sender1.send(block_align_count as u128);
 
                     let (payload_len, checksum, _time) = read_header(bin.as_mut_slice());
                     read_payload_checked(bin.as_slice(), payload_len as usize, checksum)
@@ -442,8 +441,8 @@ impl BlockDevice for SimpleDevice {
                 },
                 Ok(size) => {
                     //写入成功，则采集块写入的统计信息，并返回写入的数据长度
-                    sender0.send(1);
-                    sender1.send(buf_len as u128);
+                    let _ = sender0.send(1);
+                    let _ = sender1.send(buf_len as u128);
 
                     Ok(size)
                 },

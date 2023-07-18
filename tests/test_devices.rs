@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
 
-use pi_async::rt::multi_thread::MultiTaskRuntimeBuilder;
+use pi_async_rt::rt::multi_thread::MultiTaskRuntimeBuilder;
 
 use pi_store::devices::{BlockDevice, BlockLocation, simple_device::{Binary, SimpleDevice}};
 

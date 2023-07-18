@@ -5,13 +5,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use async_lock::Mutex;
 use crc32fast::Hasher;
 use fastcmp::Compare;
 
-use pi_async::{
-    lock::mutex_lock::Mutex,
-    rt::{AsyncRuntime, multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder}},
-};
+use pi_async_rt::rt::{AsyncRuntime, startup_global_time_loop,
+                      multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder}};
 
 use pi_hash::XHashMap;
 use pi_store::log_store::log_file::{
@@ -55,11 +54,12 @@ impl Drop for Counter {
 
 #[test]
 fn test_empty_value() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         let start = Instant::now();
         match LogFile::open(rt_copy.clone(),
                             "./log",
@@ -74,7 +74,7 @@ fn test_empty_value() {
                 println!("!!!!!!open log ok, time: {:?}", Instant::now() - start);
 
                 let rt_clone = rt_copy.clone();
-                rt_copy.spawn(rt_copy.alloc(), async move {
+                let _ = rt_copy.spawn(async move {
                     let key = "Test001".to_string().into_bytes();
                     let value = "".as_bytes();
                     let start = Instant::now();
@@ -179,11 +179,12 @@ fn test_empty_value() {
 
 #[test]
 fn test_log_append() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -197,7 +198,7 @@ fn test_log_append() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
@@ -217,11 +218,12 @@ fn test_log_append() {
 
 #[test]
 fn test_log_remove() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -235,7 +237,7 @@ fn test_log_remove() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::Remove, key.as_slice(), value);
@@ -305,11 +307,12 @@ impl TestCache {
 fn test_log_files() {
     env_logger::init();
 
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(), "./log/", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
@@ -351,11 +354,12 @@ fn test_log_files() {
 
 #[test]
 fn test_log_load() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -385,11 +389,12 @@ fn test_log_load() {
 // 修复数据
 #[test]
 fn test_repair_log_file() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn( async move {
         match repair_log(&rt_copy, "./db", 32 * 1024).await {
             Err(e) => {
                 println!("!!!!!test_repair_log_file, e: {:?}", e);
@@ -405,11 +410,12 @@ fn test_repair_log_file() {
 
 #[test]
 fn test_log_collect() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(), "./log", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
@@ -438,11 +444,12 @@ fn test_log_collect() {
 
 #[test]
 fn test_log_append_delay_commit() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -456,7 +463,7 @@ fn test_log_append_delay_commit() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
@@ -476,11 +483,12 @@ fn test_log_append_delay_commit() {
 
 #[test]
 fn test_log_remove_delay_commit() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -494,7 +502,7 @@ fn test_log_remove_delay_commit() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::Remove, key.as_slice(), value);
@@ -514,11 +522,12 @@ fn test_log_remove_delay_commit() {
 
 #[test]
 fn test_log_append_delay_commit_by_split() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -532,7 +541,7 @@ fn test_log_append_delay_commit_by_split() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
@@ -552,11 +561,12 @@ fn test_log_append_delay_commit_by_split() {
 
 #[test]
 fn test_log_remove_delay_commit_by_split() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -570,7 +580,7 @@ fn test_log_remove_delay_commit_by_split() {
                 for index in 0..10000 {
                     let log_copy = log.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::Remove, key.as_slice(), value);
@@ -590,11 +600,12 @@ fn test_log_remove_delay_commit_by_split() {
 
 #[test]
 fn test_log_split() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(),
                             "./log",
                             8000,
@@ -608,7 +619,7 @@ fn test_log_split() {
                 let counter = Arc::new(Counter(AtomicUsize::new(0), Instant::now()));
 
                 let log_copy = log.clone();
-                rt_copy.spawn(rt_copy.alloc(), async move {
+                let _ = rt_copy.spawn(async move {
                     let mut cache = TestCache::new(true);
                     let start = Instant::now();
                     match log_copy.load(&mut cache, None, 32 * 1024, true).await {
@@ -627,7 +638,7 @@ fn test_log_split() {
                     let log_copy = log.clone();
                     let count_copy = count.clone();
                     let counter_copy = counter.clone();
-                    rt_copy.spawn(rt_copy.alloc(), async move {
+                    let _ = rt_copy.spawn(async move {
                         let key = ("Test".to_string() + index.to_string().as_str()).into_bytes();
                         let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_bytes();
                         let uid = log_copy.append(LogMethod::PlainAppend, key.as_slice(), value);
@@ -659,17 +670,18 @@ fn test_log_split() {
 
 #[test]
 fn test_log_collect_logs() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
+    let _ = rt.spawn(async move {
         match LogFile::open(rt_copy.clone(), "./log", 8000, 1024 * 1024, None).await {
             Err(e) => {
                 println!("!!!!!!open log failed, e: {:?}", e);
             }
             Ok(log) => {
-                let log_paths = vec![PathBuf::from("./log/000001"), PathBuf::from("./log/000002")];
+                let log_paths = vec![PathBuf::from("./log/000000001"), PathBuf::from("./log/000000002")];
 
                 let start = Instant::now();
                 match log

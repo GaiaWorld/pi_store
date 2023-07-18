@@ -19,7 +19,7 @@ use pi_sinfo::EnumType::Bin;
 use pi_assets::{asset::{Asset, Garbageer, GarbageGuard},
                 mgr::AssetMgr,
                 allocator::Allocator};
-use pi_async::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
 
 use pi_store::{vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
                      VirtualPageWriteCmd,
