@@ -1,22 +1,16 @@
-use std::io;
 use std::mem;
 use std::thread;
 use std::sync::Arc;
 use std::default::Default;
-use std::marker::PhantomData;
 use std::time::{Duration, Instant};
-use std::collections::hash_map::Values;
 
-use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 use futures::future::{FutureExt, BoxFuture};
 use dashmap::DashMap;
 use bytes::BufMut;
 use crossbeam_channel::internal::SelectHandle;
 
-use pi_hash::XHashMap;
-use pi_sinfo::EnumType::Bin;
-use pi_assets::{asset::{Asset, Garbageer, GarbageGuard},
+use pi_assets::{asset::{Asset, Size, Garbageer, GarbageGuard},
                 mgr::AssetMgr,
                 allocator::Allocator};
 use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
@@ -25,7 +19,6 @@ use pi_store::{vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
                      VirtualPageWriteCmd,
                      page_cache::{SharedPageRelease,
                                   VirtualPageLFUCache,
-                                  VirtualPageLFUCacheDirtyIterator,
                                   SharedPageBuffer,
                                   init_global_virtual_page_lfu_cache_allocator,
                                   startup_auto_collect,
@@ -71,7 +64,9 @@ pub struct TestBin(Arc<Vec<u8>>);
 
 impl Asset for TestBin {
     type Key = u64;
+}
 
+impl Size for TestBin {
     fn size(&self) -> usize {
         self.0.len()
     }
