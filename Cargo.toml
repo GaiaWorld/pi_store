@@ -1,8 +1,12 @@
 [package]
 name = "pi_store"
 version = "0.2.0"
-authors = ["zmythleo <zmythleo@gmail.com>"]
+authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
+description = "File storage"
+repository = "https://github.com/GaiaWorld/pi_store.git"
+license = "MIT OR Apache-2.0"
+keywords = ["pi", "file", "storage"]
 
 [dependencies]
 parking_lot = "0.12"
