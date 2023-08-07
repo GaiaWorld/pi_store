@@ -977,7 +977,6 @@ impl LogFile {
                             return Err(e);
                         },
                         Ok(_) => {
-                            println!("!!!!!!bufs len: {}", bufs.len());
                             //合并指定日志文件的日志块完成，并继续合并下一个只读日志文件
                             for (buf, hasher) in bufs {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
@@ -991,7 +990,6 @@ impl LogFile {
                                     Ok(block_size) => {
                                         //写入临时整理日志文件成功，则统计写入的字节数，并则将已合并后的日志块的头写入临时整理文件
                                         total_size += block_size;
-                                        println!("!!!!!!collect part, block_size: {}, total_size: {}, total_len: {}", block_size, total_size, total_len);
                                         let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
                                         write_header(&mut header, hasher, block_size);
                                         if let Err(e) = tmp_file.write(0, header, WriteOptions::Sync(true)).await {
@@ -1008,7 +1006,6 @@ impl LogFile {
                     }
                 }
 
-                println!("!!!!!!collect finish, total_size: {}, total_len: {}", total_size, total_len);
                 //没有已合并的日志块未写入日志头
                 if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
