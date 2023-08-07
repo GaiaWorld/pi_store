@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::mem::drop;
 use std::fmt::Debug;
 use std::fs::read_dir;
 use std::time::SystemTime;
+use std::mem::{drop, swap};
 use std::path::{Path, PathBuf};
 use std::collections::{LinkedList, VecDeque};
 use std::io::{Error, Result, ErrorKind, Cursor};
@@ -49,6 +49,11 @@ const LOG_BLOCK_MOD: usize = 4096;
 * 最小日志块大小限制，32B
 */
 const MIN_LOG_BLOCK_SIZE_LIMIT: usize = 32;
+
+/*
+* 最小整理时日志块大小限制，8MB
+*/
+const MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT: usize = 8 * 1024 * 1024;
 
 /*
 * 最大日志块大小限制，2GB
@@ -950,9 +955,12 @@ impl LogFile {
                 //加载并合并所有只读日志文件
                 let mut total_size = 0;
                 let mut total_len = 0;
-                let mut block_size = 0;
                 let mut map = XHashMap::default();
-                let mut hasher = Hasher::new();
+                let buf_len = if buf_len < MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT || buf_len > MAX_LOG_BLOCK_SIZE_LIMIT {
+                    MAX_LOG_BLOCK_SIZE_LIMIT
+                } else {
+                    buf_len
+                };
                 for index in indexes {
                     let mut bufs = Vec::new();
                     match merge_block(self,
@@ -960,7 +968,6 @@ impl LogFile {
                                       &mut bufs,
                                       buf_len,
                                       read_len,
-                                      &mut hasher,
                                       &mut total_len,
                                       Some(index),
                                       true,
@@ -970,8 +977,9 @@ impl LogFile {
                             return Err(e);
                         },
                         Ok(_) => {
+                            println!("!!!!!!bufs len: {}", bufs.len());
                             //合并指定日志文件的日志块完成，并继续合并下一个只读日志文件
-                            for buf in bufs {
+                            for (buf, hasher) in bufs {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
                                 match tmp_file.write(0, buf, WriteOptions::None).await {
                                     Err(e) => {
@@ -980,32 +988,18 @@ impl LogFile {
                                                                       tmp_path.to_path_buf(),
                                                                       e)));
                                     },
-                                    Ok(size) => {
-                                        //写入临时整理日志文件成功，则统计写入的字节数，并重置缓冲区
-                                        block_size += size;
-                                        total_size += size;
-
-                                        if block_size < MAX_LOG_BLOCK_SIZE_LIMIT {
-                                            //当前已合并日志块总大小未达限制，则继续
-                                            continue;
-                                        }
-
-                                        //当前已合并日志块总大小已达限制，则将已合并后的日志块的头写入临时整理文件
+                                    Ok(block_size) => {
+                                        //写入临时整理日志文件成功，则统计写入的字节数，并则将已合并后的日志块的头写入临时整理文件
+                                        total_size += block_size;
+                                        println!("!!!!!!collect part, block_size: {}, total_size: {}, total_len: {}", block_size, total_size, total_len);
                                         let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
                                         write_header(&mut header, hasher, block_size);
-                                        match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
-                                            Err(e) => {
-                                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                                                return Err(Error::new(ErrorKind::Other,
-                                                                      format!("Write tmp log header failed, path: {:?}, reason: {:?}",
-                                                                              tmp_path.to_path_buf(),
-                                                                              e)));
-                                            },
-                                            Ok(_size) => {
-                                                //写入临时整理日志文件头成功
-                                                block_size = 0; //重置已合并的日志块大小
-                                                hasher = Hasher::new(); //重置校验器
-                                            }
+                                        if let Err(e) = tmp_file.write(0, header, WriteOptions::Sync(true)).await {
+                                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                                            return Err(Error::new(ErrorKind::Other,
+                                                                  format!("Write tmp log header failed, path: {:?}, reason: {:?}",
+                                                                          tmp_path.to_path_buf(),
+                                                                          e)));
                                         }
                                     }
                                 }
@@ -1014,47 +1008,38 @@ impl LogFile {
                     }
                 }
 
-                if block_size > 0 {
-                    //还有已合并的日志块未写入日志头，则将合并后的日志块的头写入临时整理文件
-                    let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
-                    write_header(&mut header, hasher, block_size);
-                    match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
-                        Err(e) => {
-                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
-                        },
-                        Ok(size) => {
-                            //写入临时整理日志文件头成功
-                            if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
-                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                                return Err(Error::new(ErrorKind::Other, format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}", tmp_path, collected_path, e)));
-                            }
-
-                            //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
-                            if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
-                                //清理整理后的日志文件目录失败，则立即返回错误
-                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                                return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
-                            }
-
-                            //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
-                            unsafe {
-                                let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
-                                (&mut *readable_box).clear();
-                                (&mut *readable_box).push(collected_path);
-                                Box::into_raw(readable_box); //避免被回收
-                            }
-
-                            //整理成功
-                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            Ok((total_size + size, total_len))
-                        }
-                    }
-                } else {
-                    //没有已合并的日志块未写入日志头，则立即返回整理成功
+                println!("!!!!!!collect finish, total_size: {}, total_len: {}", total_size, total_len);
+                //没有已合并的日志块未写入日志头
+                if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                    Ok((total_size, total_len))
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}",
+                                                  tmp_path,
+                                                  collected_path,
+                                                  e)));
                 }
+
+                //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
+                if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
+                    //清理整理后的日志文件目录失败，则立即返回错误
+                    self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Clean log dir failed, path: {:?}, reason: {:?}",
+                                                  self.0.path,
+                                                  e)));
+                }
+
+                //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
+                unsafe {
+                    let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
+                    (&mut *readable_box).clear();
+                    (&mut *readable_box).push(collected_path);
+                    Box::into_raw(readable_box); //避免被回收
+                }
+
+                //整理成功
+                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                Ok((total_size, total_len))
             },
         }
     }
@@ -1149,14 +1134,12 @@ impl LogFile {
                 let mut total_size = 0;
                 let mut total_len = 0;
                 let mut map = XHashMap::default();
-                let mut hasher = Hasher::new();
                 for (file_path, file) in log_path_files {
                     let mut bufs = Vec::new();
                     match merge_block_log(&mut map,
                                           &mut bufs,
                                           buf_len,
                                           read_len,
-                                          &mut hasher,
                                           &mut total_len,
                                           &file_path,
                                           &file,
@@ -1168,15 +1151,27 @@ impl LogFile {
                         },
                         Ok(_) => {
                             //合并指定日志文件的日志块完成，并继续合并下一个只读日志文件
-                            for buf in bufs {
+                            for (buf, hasher) in bufs {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
                                 match tmp_file.write(0, buf, WriteOptions::None).await {
                                     Err(e) => {
-                                        return Err(Error::new(ErrorKind::Other, format!("Write tmp log block failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
+                                        return Err(Error::new(ErrorKind::Other,
+                                                              format!("Write tmp log block failed, path: {:?}, reason: {:?}",
+                                                                      tmp_path.to_path_buf(),
+                                                                      e)));
                                     },
-                                    Ok(size) => {
-                                        //写入临时整理日志文件成功，则统计写入的字节数，并重置缓冲区
-                                        total_size += size;
+                                    Ok(block_size) => {
+                                        //写入临时整理日志文件成功，则统计写入的字节数，并将已合并后的日志块的头写入临时整理文件
+                                        total_size += block_size;
+                                        let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
+                                        write_header(&mut header, hasher, total_size);
+                                        if let Err(e) = tmp_file.write(0, header, WriteOptions::Sync(true)).await {
+                                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                                            return Err(Error::new(ErrorKind::Other,
+                                                                  format!("Write tmp log header failed, path: {:?}, reason: {:?}",
+                                                                          tmp_path.to_path_buf(),
+                                                                          e)));
+                                        }
                                     }
                                 }
                             }
@@ -1184,41 +1179,36 @@ impl LogFile {
                     }
                 }
 
-                //将合并后的日志块的头写入临时整理文件
-                let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
-                write_header(&mut header, hasher, total_size);
-                match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
-                    Err(e) => {
-                        self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                        return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
-                    },
-                    Ok(size) => {
-                        //写入临时整理日志文件头成功
-                        if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
-                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            return Err(Error::new(ErrorKind::Other, format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}", tmp_path, collected_path, e)));
-                        }
-
-                        //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
-                        if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
-                            //清理整理后的日志文件目录失败，则立即返回错误
-                            self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
-                        }
-
-                        //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
-                        unsafe {
-                            let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
-                            (&mut *readable_box).clear();
-                            (&mut *readable_box).push(collected_path);
-                            Box::into_raw(readable_box); //避免被回收
-                        }
-
-                        //整理成功
-                        self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                        Ok((total_size + size, total_len))
-                    }
+                if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
+                    self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}",
+                                                  tmp_path,
+                                                  collected_path,
+                                                  e)));
                 }
+
+                //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
+                if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
+                    //清理整理后的日志文件目录失败，则立即返回错误
+                    self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Clean log dir failed, path: {:?}, reason: {:?}",
+                                                  self.0.path,
+                                                  e)));
+                }
+
+                //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
+                unsafe {
+                    let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
+                    (&mut *readable_box).clear();
+                    (&mut *readable_box).push(collected_path);
+                    Box::into_raw(readable_box); //避免被回收
+                }
+
+                //整理成功
+                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                Ok((total_size, total_len))
             },
         }
     }
@@ -1823,10 +1813,9 @@ async fn create_tmp_log<P: AsRef<Path>>(rt: MultiTaskRuntime<()>, path: P) -> Re
 //加载指定日志文件的日志块，合并相同关键字的日志，将合并后的日志写入缓冲区，并计算校验码
 async fn merge_block(log_file: &LogFile,
                      map: &mut XHashMap<Arc<Vec<u8>>, ()>,
-                     bufs: &mut Vec<Vec<u8>>,
+                     bufs: &mut Vec<(Vec<u8>, Hasher)>,
                      buf_len: usize,
                      mut read_len: u64,
-                     hasher: &mut Hasher,
                      total_len: &mut usize,
                      log_index: Option<usize>,
                      is_checksum: bool,
@@ -1860,7 +1849,8 @@ async fn merge_block(log_file: &LogFile,
     };
 
     let mut offset = None; //从日志文件的尾部开始读取缓冲区
-    let mut buf = Vec::with_capacity(buf_len);
+    let mut hasher = Hasher::new();
+    let mut buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
     loop {
         match read_log_file(file_path.clone(),
                             file.clone(),
@@ -1901,19 +1891,39 @@ async fn merge_block(log_file: &LogFile,
                                     hasher.update(&buf[off..]);
                                     *total_len += 1;
                                 }
+
+                                if buf.len() >= buf_len {
+                                    //合并缓冲区已满，则将缓冲区写入缓冲区向量中，并创建新的合并缓冲区
+                                    let mut ready_hasher = Hasher::new();
+                                    swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                    bufs.push((buf, ready_hasher));
+                                    buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
+                                    hasher = Hasher::new(); //重置校验器
+                                }
                             }
                         }
 
                         if next_file_offset == 0 && next_len == 0 {
-                            //已读到日志文件头，则将缓冲区写入缓冲区向量中，并立即返回
-                            bufs.push(buf);
+                            //已读到日志文件头
+                            if buf.len() > 0 {
+                                //当前缓冲区有数据，则将缓冲区写入缓冲区向量中
+                                let mut ready_hasher = Hasher::new();
+                                swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                bufs.push((buf, ready_hasher));
+                            }
+
                             break;
                         } else {
                             //更新日志文件位置
                             if buf.len() >= buf_len {
                                 //合并缓冲区已满，则将缓冲区写入缓冲区向量中，并创建新的合并缓冲区
-                                bufs.push(buf);
-                                buf = Vec::with_capacity(buf_len);
+                                let mut ready_hasher = Hasher::new();
+                                swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                bufs.push((buf, ready_hasher));
+                                buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
                             }
 
                             offset = Some(next_file_offset);
@@ -1930,17 +1940,17 @@ async fn merge_block(log_file: &LogFile,
 
 //加载指定日志文件的指定日志块，合并相同关键字的日志，将合并后的日志写入缓冲区，并计算校验码，成功返回下一个日志块头的偏移，返回空表示已加载到日志文件头
 async fn merge_block_log(map: &mut XHashMap<Arc<Vec<u8>>, ()>,
-                         bufs: &mut Vec<Vec<u8>>,
+                         bufs: &mut Vec<(Vec<u8>, Hasher)>,
                          buf_len: usize,
                          mut read_len: u64,
-                         hasher: &mut Hasher,
                          total_len: &mut usize,
                          file_path: &PathBuf,
                          file: &AsyncFile<()>,
                          is_checksum: bool,
                          is_hidden_remove: bool) -> Result<()> {
     let mut offset = None; //从日志文件的尾部开始读取缓冲区
-    let mut buf = Vec::with_capacity(buf_len);
+    let mut hasher = Hasher::new();
+    let mut buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
     loop {
         match read_log_file(file_path.clone(),
                             file.clone(),
@@ -1981,14 +1991,26 @@ async fn merge_block_log(map: &mut XHashMap<Arc<Vec<u8>>, ()>,
                                     hasher.update(&buf[off..]);
                                     *total_len += 1;
                                 }
+
+                                if buf.len() >= buf_len {
+                                    //合并缓冲区已满，则将缓冲区写入缓冲区向量中，并创建新的合并缓冲区
+                                    let mut ready_hasher = Hasher::new();
+                                    swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                    bufs.push((buf, ready_hasher));
+                                    buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
+                                }
                             }
                         }
 
                         if next_file_offset == 0 && next_len == 0 {
-                            //已读到日志文件头，则立即返回
-                            if buf.len() >= buf_len {
-                                //合并缓冲区已满，则将缓冲区写入缓冲区向量中，并创建新的合并缓冲区
-                                bufs.push(buf);
+                            //已读到日志文件头
+                            if buf.len() > 0 {
+                                //当前缓冲区有数据，则将缓冲区写入缓冲区向量中
+                                let mut ready_hasher = Hasher::new();
+                                swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                bufs.push((buf, ready_hasher));
                             }
 
                             break;
@@ -1996,8 +2018,11 @@ async fn merge_block_log(map: &mut XHashMap<Arc<Vec<u8>>, ()>,
                             //更新日志文件位置
                             if buf.len() >= buf_len {
                                 //合并缓冲区已满，则将缓冲区写入缓冲区向量中，并创建新的合并缓冲区
-                                bufs.push(buf);
-                                buf = Vec::with_capacity(buf_len);
+                                let mut ready_hasher = Hasher::new();
+                                swap(&mut ready_hasher, &mut hasher); //交换当前校验器到已就绪的校验器，并重置当前校验器
+
+                                bufs.push((buf, ready_hasher));
+                                buf = Vec::with_capacity(MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT);
                             }
 
                             offset = Some(next_file_offset);

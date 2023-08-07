@@ -422,13 +422,13 @@ fn test_log_collect() {
             }
             Ok(log) => {
                 let start = Instant::now();
-                match log.collect(1024 * 1024, 32 * 1024, false).await {
+                match log.collect(2 * 1024 * 1024 * 1024, 32 * 1024, false).await {
                     Err(e) => {
-                        println!("!!!!!!load log failed, e: {:?}", e);
+                        println!("!!!!!!collect log failed, e: {:?}", e);
                     }
                     Ok((size, len)) => {
                         println!(
-                            "!!!!!!load log ok, size: {:?}, len: {:?}, time: {:?}",
+                            "!!!!!!collect log ok, size: {:?}, len: {:?}, time: {:?}",
                             size,
                             len,
                             Instant::now() - start
@@ -685,7 +685,7 @@ fn test_log_collect_logs() {
 
                 let start = Instant::now();
                 match log
-                    .collect_logs(vec![], log_paths, 1024 * 1024, 32 * 1024, true)
+                    .collect_logs(vec![], log_paths, 2 * 1024 * 1024 * 1024, 32 * 1024, true)
                     .await
                 {
                     Err(e) => {
