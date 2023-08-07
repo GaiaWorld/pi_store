@@ -1,6 +1,5 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::mem::drop;
 use std::fmt::Debug;
 use std::fs::read_dir;
 use std::time::SystemTime;
@@ -51,6 +50,11 @@ const LOG_BLOCK_MOD: usize = 4096;
 * 最小日志块大小限制，32B
 */
 const MIN_LOG_BLOCK_SIZE_LIMIT: usize = 32;
+
+/*
+* 最小整理时日志块大小限制，8MB
+*/
+const MIN_LOG_BLOCK_SIZE_LIMIT_BY_COLLECT: usize = 8 * 1024 * 1024;
 
 /*
 * 最大日志块大小限制，2GB
