@@ -950,6 +950,7 @@ impl LogFile {
                 //加载并合并所有只读日志文件
                 let mut total_size = 0;
                 let mut total_len = 0;
+                let mut block_size = 0;
                 let mut map = XHashMap::default();
                 let mut hasher = Hasher::new();
                 for index in indexes {
@@ -974,11 +975,38 @@ impl LogFile {
                                 //合并缓冲区已满，则将缓冲区写入临时整理日志文件
                                 match tmp_file.write(0, buf, WriteOptions::None).await {
                                     Err(e) => {
-                                        return Err(Error::new(ErrorKind::Other, format!("Write tmp log block failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
+                                        return Err(Error::new(ErrorKind::Other,
+                                                              format!("Write tmp log block failed, path: {:?}, reason: {:?}",
+                                                                      tmp_path.to_path_buf(),
+                                                                      e)));
                                     },
                                     Ok(size) => {
                                         //写入临时整理日志文件成功，则统计写入的字节数，并重置缓冲区
+                                        block_size += size;
                                         total_size += size;
+
+                                        if block_size < MAX_LOG_BLOCK_SIZE_LIMIT {
+                                            //当前已合并日志块总大小未达限制，则继续
+                                            continue;
+                                        }
+
+                                        //当前已合并日志块总大小已达限制，则将已合并后的日志块的头写入临时整理文件
+                                        let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
+                                        write_header(&mut header, hasher, block_size);
+                                        match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
+                                            Err(e) => {
+                                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                                                return Err(Error::new(ErrorKind::Other,
+                                                                      format!("Write tmp log header failed, path: {:?}, reason: {:?}",
+                                                                              tmp_path.to_path_buf(),
+                                                                              e)));
+                                            },
+                                            Ok(_size) => {
+                                                //写入临时整理日志文件头成功
+                                                block_size = 0; //重置已合并的日志块大小
+                                                hasher = Hasher::new(); //重置校验器
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -986,40 +1014,46 @@ impl LogFile {
                     }
                 }
 
-                //将合并后的日志块的头写入临时整理文件
-                let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
-                write_header(&mut header, hasher, total_size);
-                match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
-                    Err(e) => {
-                        self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                        return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
-                    },
-                    Ok(size) => {
-                        //写入临时整理日志文件头成功
-                        if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
+                if block_size > 0 {
+                    //还有已合并的日志块未写入日志头，则将合并后的日志块的头写入临时整理文件
+                    let mut header = Vec::with_capacity(DEFAULT_LOG_BLOCK_HEADER_LEN);
+                    write_header(&mut header, hasher, block_size);
+                    match tmp_file.write(0, header, WriteOptions::Sync(true)).await {
+                        Err(e) => {
                             self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            return Err(Error::new(ErrorKind::Other, format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}", tmp_path, collected_path, e)));
-                        }
+                            return Err(Error::new(ErrorKind::Other, format!("Write tmp log header failed, path: {:?}, reason: {:?}", tmp_path.to_path_buf(), e)));
+                        },
+                        Ok(size) => {
+                            //写入临时整理日志文件头成功
+                            if let Err(e) = rename(self.0.rt.clone(), tmp_path.clone(), collected_path.clone()).await {
+                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                                return Err(Error::new(ErrorKind::Other, format!("Rename tmp log failed, from: {:?}, to: {:?}, reason: {:?}", tmp_path, collected_path, e)));
+                            }
 
-                        //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
-                        if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
-                            //清理整理后的日志文件目录失败，则立即返回错误
+                            //清理整理后的日志文件目录，将被整理的日志文件改名为备份日志文件
+                            if let Err(e) = clean(&self.0.rt.clone(), self.0.path.clone()).await {
+                                //清理整理后的日志文件目录失败，则立即返回错误
+                                self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                                return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
+                            }
+
+                            //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
+                            unsafe {
+                                let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
+                                (&mut *readable_box).clear();
+                                (&mut *readable_box).push(collected_path);
+                                Box::into_raw(readable_box); //避免被回收
+                            }
+
+                            //整理成功
                             self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                            return Err(Error::new(ErrorKind::Other, format!("Clean log dir failed, path: {:?}, reason: {:?}", self.0.path, e)));
+                            Ok((total_size + size, total_len))
                         }
-
-                        //移出被整理的只读文件路径，将整理后的只读文件路径写入只读日志文件路径列表
-                        unsafe {
-                            let mut readable_box = Box::from_raw(self.0.readable.load(Ordering::Relaxed));
-                            (&mut *readable_box).clear();
-                            (&mut *readable_box).push(collected_path);
-                            Box::into_raw(readable_box); //避免被回收
-                        }
-
-                        //整理成功
-                        self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
-                        Ok((total_size + size, total_len))
                     }
+                } else {
+                    //没有已合并的日志块未写入日志头，则立即返回整理成功
+                    self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
+                    Ok((total_size, total_len))
                 }
             },
         }
