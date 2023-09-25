@@ -428,9 +428,9 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
         async move {
             //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-            let mut check_pointes_locked = logger.0.check_points.lock().await;
+            let _check_pointes_locked = logger.0.check_points.lock().await;
             new_check_point(&logger, false).await;
-        }
+        }.boxed()
     }
 }
 
