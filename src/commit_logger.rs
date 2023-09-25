@@ -233,7 +233,7 @@ impl AsyncCommitLog for CommitLogger {
             if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
                 //提交日志的当前可写检查点对应的可写文件，已写入字节数量已达限制
                 //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-                new_check_point(&logger, false).await;
+                let _ = new_check_point(&logger, false).await;
             }
 
             if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
@@ -243,7 +243,7 @@ impl AsyncCommitLog for CommitLogger {
                     if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
                         //当前已完成确认的检查点是当前可写检查点
                         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为已完成确认
-                        new_check_point(&logger, true).await;
+                        let _ = new_check_point(&logger, true).await;
                     }
 
                     //整理只读检查点的文件路径列表中已完成确认且可以移除的只读检查点
@@ -429,7 +429,7 @@ impl AsyncCommitLog for CommitLogger {
         async move {
             //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
             let _check_pointes_locked = logger.0.check_points.lock().await;
-            new_check_point(&logger, false).await;
+            new_check_point(&logger, false).await
         }.boxed()
     }
 }
@@ -437,8 +437,8 @@ impl AsyncCommitLog for CommitLogger {
 // 为提交日志文件，异步创建新的可写检查点
 // 设置上一个可写检查点是否已完成确认，并将上一个可写检查点追加到只读检查点的文件路径列表
 async fn new_check_point(logger: &CommitLogger,
-                         is_finish_confirm: bool) {
-    let _ = logger.0.file.split().await; //立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
+                         is_finish_confirm: bool) -> Result<usize> {
+    let log_index = logger.0.file.split().await?; //立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
 
     //设置新的可写检查点
     let check_point_counter = Arc::new(AtomicU64::new(0)); //初始化可写检查点的计数器
@@ -451,6 +451,8 @@ async fn new_check_point(logger: &CommitLogger,
 
     //重置新的可写日志文件的已写入字节数量
     logger.0.writed_size.store(0, Ordering::Relaxed);
+
+    Ok(log_index)
 }
 
 // 整理提交日志记录器，在重播时不允许整理
@@ -464,7 +466,7 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
     }
 
     //获取检查点表的异步锁
-    let mut check_pointes_locked = logger.0.check_points.lock().await;
+    let check_pointes_locked = logger.0.check_points.lock().await;
 
     //检查是否需要生成新的可写检查点
     if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
