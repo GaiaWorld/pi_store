@@ -239,6 +239,7 @@ impl AsyncCommitLog for CommitLogger {
             if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
                 //从检查点表中移除已确认的事务，并减少事务对应检查点的计数
                 if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    println!("!!!!!!check_point_path: {:?}", check_point_path);
                     //当前已确认事务对应的检查点的计数已清空，则表示事务对应检查点的所有事务已完成确认
                     if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
                         //当前已完成确认的检查点是当前可写检查点
@@ -251,6 +252,7 @@ impl AsyncCommitLog for CommitLogger {
                     {
                         let only_reads = &mut *logger.0.only_reads.lock();
                         for (path, is_finish_confirm) in only_reads.iter_mut() {
+                            println!("!!!!!!only_read_path: {:?}", path);
                             if check_point_path.as_ref() == path {
                                 //当前已完成确认的检查点是只读检查点
                                 *is_finish_confirm = true; //标记当前只读检查点的状态为已完成确认
@@ -259,6 +261,7 @@ impl AsyncCommitLog for CommitLogger {
 
                         let mut prev = true; //上一个只读检查点是否已完成确认
                         while let Some((path, is_finish_confirm)) = only_reads.pop_front() {
+                            println!("!!!!!!prev: {:?}, is_finish_confirm: {:?}, path: {:?}", prev, is_finish_confirm, path);
                             if prev && is_finish_confirm {
                                 //上一个只读检查点已完成确认，且当前只读检查点也完成了确认
                                 //则将当前只读检查点的日志文件设置为备份的只读文件，并从只读检查点的文件路径列表中移除
@@ -416,6 +419,7 @@ impl AsyncCommitLog for CommitLogger {
 
             //执行重播时缓冲的确认提交日志
             let replay_confirms = &mut *logger.0.replay_confirm_buf.lock();
+            println!("!!!!!!replay_confirms: {}, check_points: {}", replay_confirms.len(), logger.0.check_points.lock().await.len());
             while let Some(commit_uid) = replay_confirms.pop_front() {
                 let _ = logger.confirm(commit_uid).await?;
             }
