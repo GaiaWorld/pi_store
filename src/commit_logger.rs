@@ -220,6 +220,7 @@ impl AsyncCommitLog for CommitLogger {
 
     fn confirm(&self, commit_uid: Self::Cid) -> BoxFuture<Result<()>> {
         if self.0.is_replaying.load(Ordering::Relaxed) {
+            println!("!!!!!!confirm_replay");
             //提交日志记录器正在重播，则确认提交的提交唯一id将会被缓冲，并立即返回
             //等待重播完成后，再确认
             return self.confirm_replay(commit_uid);
@@ -404,8 +405,10 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
+            println!("!!!!!!confirm_replay0");
             //重播时的确认提交日志，不允许直接确认，需要缓冲确认的提交唯一id，并在完成重播时统一确认
             logger.0.replay_confirm_buf.lock().push_back(commit_uid);
+            println!("!!!!!!confirm_replay1");
             Ok(())
         }.boxed()
     }
