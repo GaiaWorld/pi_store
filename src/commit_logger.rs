@@ -179,7 +179,7 @@ impl AsyncCommitLog for CommitLogger {
     type C = usize;
     type Cid = Guid;
 
-    fn append<B>(&self, commit_uid: Self::Cid, log: B) -> BoxFuture<Result<Self::C>>
+    fn append<B>(&self, commit_uid: Self::Cid, log: B) -> BoxFuture<'static, Result<Self::C>>
         where B: BufMut + AsRef<[u8]> + Send + Sized + 'static {
         let logger = self.clone();
 
@@ -208,7 +208,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn flush(&self, log_handle: Self::C) -> BoxFuture<Result<()>> {
+    fn flush(&self, log_handle: Self::C) -> BoxFuture<'static, Result<()>> {
         let mut logger = self.clone();
 
         async move {
@@ -218,7 +218,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn confirm(&self, commit_uid: Self::Cid) -> BoxFuture<Result<()>> {
+    fn confirm(&self, commit_uid: Self::Cid) -> BoxFuture<'static, Result<()>> {
         if self.0.is_replaying.load(Ordering::Relaxed) {
             //提交日志记录器正在重播，则确认提交的提交唯一id将会被缓冲，并立即返回
             //等待重播完成后，再确认
@@ -284,7 +284,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn start_replay<B, F>(&self, mut callback: Arc<F>) -> BoxFuture<Result<(usize, usize)>>
+    fn start_replay<B, F>(&self, mut callback: Arc<F>) -> BoxFuture<'static, Result<(usize, usize)>>
         where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
@@ -377,7 +377,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn append_replay<B>(&self, commit_uid: Self::Cid, _log: B) -> BoxFuture<Result<Self::C>>
+    fn append_replay<B>(&self, commit_uid: Self::Cid, _log: B) -> BoxFuture<'static, Result<Self::C>>
         where B: BufMut + AsRef<[u8]> + Send + Sized + 'static {
         let logger = self.clone();
 
@@ -393,14 +393,14 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn flush_replay(&self, _log_handle: Self::C) -> BoxFuture<Result<()>> {
+    fn flush_replay(&self, _log_handle: Self::C) -> BoxFuture<'static, Result<()>> {
         async move {
             //重播忽略追加提交日志，则忽略刷新提交日志
             Ok(())
         }.boxed()
     }
 
-    fn confirm_replay(&self, commit_uid: Self::Cid) -> BoxFuture<Result<()>> {
+    fn confirm_replay(&self, commit_uid: Self::Cid) -> BoxFuture<'static, Result<()>> {
         let logger = self.clone();
 
         async move {
@@ -410,7 +410,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn finish_replay(&self) -> BoxFuture<Result<()>> {
+    fn finish_replay(&self) -> BoxFuture<'static, Result<()>> {
         let logger = self.clone();
 
         async move {
@@ -439,7 +439,7 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    fn append_check_point(&self) -> BoxFuture<Result<usize>> {
+    fn append_check_point(&self) -> BoxFuture<'static, Result<usize>> {
         let logger = self.clone();
         async move {
             //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
