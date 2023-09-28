@@ -417,6 +417,7 @@ impl AsyncCommitLog for CommitLogger {
             let check_points_len = logger.0.check_points.lock().await.len();
 
             loop {
+                println!("!!!!!!replay_confirm_buf_len: {}", logger.0.replay_confirm_buf.lock().len());
                 if logger.0.replay_confirm_buf.lock().len() < check_points_len {
                     //还有未确认已注册到检查点表中的事务，则稍后继续
                     logger.0.rt.yield_now().await;
