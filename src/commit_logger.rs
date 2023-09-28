@@ -406,6 +406,7 @@ impl AsyncCommitLog for CommitLogger {
         async move {
             //重播时的确认提交日志，不允许直接确认，需要缓冲确认的提交唯一id，并在完成重播时统一确认
             logger.0.replay_confirm_buf.lock().push_back(commit_uid);
+            println!("!!!!!!confirm_replay_len: {}", logger.0.replay_confirm_buf.lock().len());
             Ok(())
         }.boxed()
     }
@@ -417,7 +418,7 @@ impl AsyncCommitLog for CommitLogger {
             let check_points_len = logger.0.check_points.lock().await.len();
 
             loop {
-                println!("!!!!!!replay_confirm_buf_len: {}", logger.0.replay_confirm_buf.lock().len());
+                println!("!!!!!!replay_confirm_len: {}, check_points_len: {}", logger.0.replay_confirm_buf.lock().len(), check_points_len);
                 if logger.0.replay_confirm_buf.lock().len() < check_points_len {
                     //还有未确认已注册到检查点表中的事务，则稍后继续
                     logger.0.rt.yield_now().await;
