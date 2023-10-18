@@ -875,6 +875,11 @@ impl LogFile {
         }
     }
 
+    /// 获取当前日志编号
+    pub fn current_log_index(&self) -> usize {
+        self.0.log_id.load(Ordering::Relaxed)
+    }
+
     //将最近的只读日志文件修改为备份的只读日志文件
     pub async fn last_readable_to_back(&self) -> Result<()> {
         let last_readable_path = self.last_readable_path();

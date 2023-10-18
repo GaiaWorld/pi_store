@@ -424,8 +424,21 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
+    /// 获取当前检查点
+    fn current_check_point(&self) -> BoxFuture<'static, usize> {
+        let logger = self.clone();
+
+        async move {
+            logger
+                .0
+                .file
+                .current_log_index()
+        }.boxed()
+    }
+
     fn append_check_point(&self) -> BoxFuture<'static, Result<usize>> {
         let logger = self.clone();
+
         async move {
             //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
             let _check_pointes_locked = logger.0.check_points.lock().await;

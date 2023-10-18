@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.3.1"
+version = "0.5.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "File storage"
@@ -23,7 +23,7 @@ dashmap = "5.5"
 url = "2.2"
 pi-async-rt = "0.1"
 pi_async_file = "0.5"
-pi_async_transaction = "0.3"
+pi_async_transaction = "0.5"
 async-lock = "2.7"
 async-channel = "1.9"
 pi_hash_value = "0.1"
@@ -47,3 +47,5 @@ pi_share = "0.4"
 env_logger = "0.9"
 rand = { version = "0.8", features = ["small_rng"] }
 persy = "1.1"
+
+
