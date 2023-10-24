@@ -253,7 +253,21 @@ impl AsyncCommitLog for CommitLogger {
                         for (path, is_finish_confirm) in only_reads.iter_mut() {
                             if check_point_path.as_ref() == path {
                                 //当前已完成确认的检查点是只读检查点
-                                *is_finish_confirm = true; //标记当前只读检查点的状态为已完成确认
+                                *is_finish_confirm = true; //标记只读检查点的状态为已完成确认
+                            } else {
+                                match path.metadata() {
+                                    Err(e) => {
+                                        //获取只读检查点的元信息失败，则记录并继续
+                                        warn!("Confirm commited transaction failed, path: {:?}, reason: {:?}", path, e);
+                                    },
+                                    Ok(meta) => {
+                                        //获取只读检查点的元信息成功
+                                        if meta.len() == 0 {
+                                            //当前只读检查点没有内容
+                                            *is_finish_confirm = true; //标记只读检查点的状态为已完成确认
+                                        }
+                                    }
+                                }
                             }
                         }
 
