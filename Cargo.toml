@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.5.2"
+version = "0.5.3"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "File storage"
@@ -29,7 +29,7 @@ async-channel = "1.9"
 pi_hash_value = "0.1"
 pi_bon = "0.2"
 pi_handler = "=0.1.6"
-pi_atom = "=0.2.5"
+pi_atom = "=0.2.6"
 pi_gray = "0.1"
 pi_guid = "0.1"
 pi_util = "0.1"
@@ -40,8 +40,8 @@ pi_hash = "0.1"
 crc32fast = "1.2"
 fastcmp = "1.0"
 num_cpus = "1.16"
-pi_assets = "0.13"
-pi_share = "=0.4.15"
+pi_assets = "=0.13.4"
+pi_share = "=0.4.11"
 
 [dev-dependencies]
 env_logger = "0.9"
