@@ -9,3 +9,7 @@ _$lmdb
 _$sinfo
 testdb
 /.idea
+/device
+/page_table
+/buddy_blocks
+/buddy_blocks1
