@@ -204,6 +204,7 @@ impl<
     D: VirtualPageWriteDelta<Content = C>,
     P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
 > Garbageer<SharedPageBuffer<C, O, B, D, P>> for SharedPageBufferReleaseCallback<C, O, B, D, P> {
+    /// 回收引用方法，在锁内执行， 获得kv的引用， guard必须在方法外释放，释放时删除kv数据
     fn garbage_ref(&self,
                    k: &u128,
                    v: &SharedPageBuffer<C, O, B, D, P>,
@@ -228,13 +229,16 @@ impl<
                     } else {
                         //待释放的虚拟页不存在对应的释放处理器
                         Box::into_raw(boxed); //避免提前释放
-                        panic!("Release shared page buffer failed, manager_id: {:?}, page_id: {:?}, reason: handler not exist", page_id.owner_uid(), page_id);
+                        error!("Release shared page buffer failed, manager_id: {:?}, page_id: {:?}, reason: handler not exist",
+                            page_id.owner_uid(),
+                            page_id);
                     }
                 }
             });
         } else {
             //虚拟页的共享页缓冲释放回调不存在
-            warn!("Garbage ref warning, page_id: {}, reason: release callback not exist", uid);
+            warn!("Garbage ref warning, page_id: {}, reason: release callback not exist",
+                uid);
         }
     }
 }
@@ -369,7 +373,8 @@ impl<
             page_id: u128,
             loading: BoxFuture<'static, Result<PageBuffer<C, O, B, D, P>>>,
             loaded: Box<dyn Fn(&PageBuffer<C, O, B, D, P>) + Send + 'static>)
-            -> BoxFuture<'static, Result<Arc<PageBuffer<C, O, B, D, P>>>> {
+        -> BoxFuture<'static, Result<Arc<PageBuffer<C, O, B, D, P>>>>
+    {
         let mgr = self.0.mgr.clone();
         async move {
             match AssetMgr::load(&mgr, &page_id) {

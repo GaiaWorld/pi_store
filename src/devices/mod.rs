@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::hash::Hash;
 use std::io::Result;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use url::Url;
@@ -145,6 +146,19 @@ impl From<u8> for DeviceStatus {
     }
 }
 
+impl From<DeviceStatus> for u8 {
+    fn from(value: DeviceStatus) -> Self {
+        match value {
+            DeviceStatus::Inited => 0,
+            DeviceStatus::Running => 1,
+            DeviceStatus::Busy => 2,
+            DeviceStatus::Pended => 3,
+            DeviceStatus::Closing => 4,
+            DeviceStatus::Closed => 5,
+        }
+    }
+}
+
 ///
 /// 块设备统计信息
 ///
@@ -249,6 +263,9 @@ pub trait BlockDevice: Send + Sync + 'static {
     /// 判断是否需要外部调用整理方法
     fn is_require_collect(&self) -> bool;
 
+    /// 判断指定块位置是否空闲
+    fn is_freed(&self, location: &BlockLocation) -> bool;
+
     /// 获取当前块设备的容量，返回空表示无限制容量，单位B
     fn capacity(&self) -> Option<u64>;
 
@@ -263,6 +280,9 @@ pub trait BlockDevice: Send + Sync + 'static {
 
     /// 获取最大块大小，单位字节
     fn max_block_size(&self) -> usize;
+
+    /// 获取指定块的大小，单位B
+    fn block_size(&self, location: &BlockLocation) -> usize;
 
     /// 获取当前块设备的URL
     fn get_url(&self) -> Option<Url>;
@@ -287,13 +307,56 @@ pub trait BlockDevice: Send + Sync + 'static {
     fn read(&self, location: &BlockLocation) -> BoxFuture<Result<Self::Buf>>;
 
     /// 异步从块设备的指定块位置上写入数据
-    fn write(&self, location: &BlockLocation, buf: &Self::Buf) -> BoxFuture<Result<usize>>;
+    fn write(&self,
+             location: &BlockLocation,
+             buf: &Self::Buf,
+             option: WriteOption) -> BoxFuture<Result<usize>>;
 
     /// 异步释放指定块位置的块，释放未分配的块或释放被释放过的块是未定义行为
     fn free_block(&self, location: &BlockLocation) -> BoxFuture<bool>;
 
     /// 异步整理已分配的所有块
     fn collect_alloced_blocks(&self, alloced: &[BlockLocation]) -> BoxFuture<Result<usize>>;
+
+    /// 获取一个块迭代器，用于按顺序遍历块设备的所有块
+    fn blocks_iter(&self)
+        -> BoxFuture<Option<Box<dyn DoubleEndedIterator<Item = BlockLocation>>>>;
+
+    /// 获取当前块设备的提交轮次
+    fn commit_round(&self) -> u64;
+
+    /// 监听块设备提交事件
+    fn on_commit(&self) -> BoxFuture<Result<Box<dyn CommitEvent>>>;
+}
+
+///
+/// 异步从块设备的指定块位置上写入数据的选项
+///
+#[derive(Debug, Clone, Copy)]
+pub enum WriteOption {
+    None,       //不同步关键数据
+    Sync,       //只同步关键数据
+    SyncAll,    //同步关键数据和元信息
+}
+
+///
+/// 块设备提交事件
+///
+pub trait CommitEvent {
+    /// 判断是否正在提交
+    fn is_commiting(&self) -> bool;
+
+    /// 判断是否已提交
+    fn is_commited(&self) -> bool;
+
+    /// 当前提交轮次
+    fn round(&self) -> u64;
+
+    /// 当前提交时间
+    fn time(&self) -> Duration;
+
+    /// 当前提交结果
+    fn result(&self) -> Option<&Result<()>>;
 }
 
 ///

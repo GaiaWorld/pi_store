@@ -2,7 +2,7 @@ use std::mem;
 use std::ops::Bound::Included;
 use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, Ordering}};
 use std::fmt::{Result as GenResult, Formatter, Debug};
@@ -20,7 +20,7 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_file::file::{AsyncFileOptions, AsyncFile, WriteOptions};
 
-use crate::devices::{DeviceType, DeviceValueType, DeviceDetailMap, DeviceStatus, DeviceStatistics, BlockDevice, BlockLocation, EMPTY_BLOCK_LOCATION};
+use crate::devices::{DeviceType, DeviceValueType, DeviceDetailMap, DeviceStatus, DeviceStatistics, BlockDevice, BlockLocation, EMPTY_BLOCK_LOCATION, CommitEvent, WriteOption};
 
 /// 块头由4B块负载长度 + 4字节校验码 + 8字节写入时间，单位ms
 const DEFAULT_BLOCK_HEAD_LEN: usize = 16;
@@ -234,6 +234,10 @@ impl BlockDevice for SimpleDevice {
         true
     }
 
+    fn is_freed(&self, location: &BlockLocation) -> bool {
+        false
+    }
+
     fn capacity(&self) -> Option<u64> {
         None
     }
@@ -252,6 +256,10 @@ impl BlockDevice for SimpleDevice {
 
     fn max_block_size(&self) -> usize {
         self.block_unit_len as usize * MAX_BLOCK_UNIT_COUNT as usize
+    }
+
+    fn block_size(&self, location: &BlockLocation) -> usize {
+        todo!()
     }
 
     fn get_url(&self) -> Option<Url> {
@@ -407,7 +415,10 @@ impl BlockDevice for SimpleDevice {
 
     /// 异步从块设备的指定块位置上写入数据
     /// 块数据由4B块负载长度 + 4字节校验码 + 8字节写入时间，单位ms + 负载组成
-    fn write(&self, location: &BlockLocation, buf: &Self::Buf) -> BoxFuture<Result<usize>> {
+    fn write(&self,
+             location: &BlockLocation,
+             buf: &Self::Buf,
+             _option: WriteOption) -> BoxFuture<Result<usize>> {
         let url = self.get_url();
         let file = self.file.clone();
         let block_unit_len = self.block_unit_len;
@@ -533,6 +544,25 @@ impl BlockDevice for SimpleDevice {
             }
 
             Ok(frees.lock().len())
+        }.boxed()
+    }
+
+    fn blocks_iter(&self)
+                   -> BoxFuture<Option<Box<dyn DoubleEndedIterator<Item = BlockLocation>>>> {
+        async {
+            None
+        }.boxed()
+    }
+
+    fn commit_round(&self) -> u64 {
+        0
+    }
+
+    /// 监听块设备提交事件
+    fn on_commit(&self) -> BoxFuture<Result<Box<dyn CommitEvent>>> {
+        async move {
+            let boxed: Box<dyn CommitEvent> = Box::new(Event);
+            Ok(boxed)
         }.boxed()
     }
 }
@@ -703,5 +733,29 @@ fn write_header(bin: Binary,
     buf.put_slice(slice);
 
     buf
+}
+
+pub struct Event;
+
+impl CommitEvent for Event {
+    fn is_commiting(&self) -> bool {
+        false
+    }
+
+    fn is_commited(&self) -> bool {
+        !self.is_commiting()
+    }
+
+    fn round(&self) -> u64 {
+        0
+    }
+
+    fn time(&self) -> Duration {
+        Duration::default()
+    }
+
+    fn result(&self) -> Option<&Result<()>> {
+        Some(&Ok(()))
+    }
 }
 

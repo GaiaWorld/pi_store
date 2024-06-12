@@ -1,7 +1,7 @@
-use std::mem;
 use std::thread;
 use std::sync::Arc;
 use std::default::Default;
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::unbounded;
@@ -9,11 +9,15 @@ use futures::future::{FutureExt, BoxFuture};
 use dashmap::DashMap;
 use bytes::BufMut;
 use crossbeam_channel::internal::SelectHandle;
+use futures::task::SpawnExt;
 
 use pi_assets::{asset::{Asset, Size, Garbageer, GarbageGuard},
                 mgr::AssetMgr,
                 allocator::Allocator};
-use pi_async_rt::rt::{AsyncRuntime, multi_thread::MultiTaskRuntimeBuilder};
+use pi_async_rt::rt::{AsyncRuntime,
+                      AsyncValueNonBlocking,
+                      multi_thread::MultiTaskRuntimeBuilder,
+                      startup_global_time_loop};
 
 use pi_store::{vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
                      VirtualPageWriteCmd,
@@ -26,9 +30,9 @@ use pi_store::{vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
                      page_table::VirtualPageTable,
                      page_pool::{VirtualPageCachingStrategy,
                                  PageBuffer},
-                     page_manager::VirtualPageManagerBuilder},
+                     page_manager::{VirtualPageManagerBuilder, VirtualPageManager}},
                devices::simple_device::{Binary, SimpleDevice}};
-use pi_store::vpm::page_manager::VirtualPageManager;
+use pi_blocks_allocator::device::{BuddyBlocksDeviceBuilder, BuddyBlocksDevice};
 
 // Dashmap5.x后出现的Bug
 #[test]
@@ -40,7 +44,7 @@ fn test_dashmap_bug() {
         map_1.insert(i, "foobar".to_string());
     }
 
-    let _writer = std::thread::spawn(move || loop {
+    let _writer = thread::spawn(move || loop {
         println!("writer iteration");
         for i in 0..1000 {
             let mut item = map_1.get_mut(&i).unwrap();
@@ -48,7 +52,7 @@ fn test_dashmap_bug() {
         }
     });
 
-    let _reader = std::thread::spawn(move || loop {
+    let _reader = thread::spawn(move || loop {
         println!("reader iteration");
         for i in 0..1000 {
             let j = i32::min(i + 100, 1000);
@@ -56,7 +60,34 @@ fn test_dashmap_bug() {
         }
     });
 
-    std::thread::sleep(Duration::from_secs(1000000000));
+    thread::sleep(Duration::from_secs(1000000000));
+}
+
+#[test]
+fn test_async_value() {
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let rt_clone = rt_copy.clone();
+        let value = AsyncValueNonBlocking::new();
+        let value_copy = value.clone();
+        rt_copy.spawn(async move {
+            let value_clone = value_copy.clone();
+            rt_clone.spawn(async move {
+                let r = value_clone.await;
+                println!("!!!!!!1");
+            });
+
+            value_copy.set(());
+        });
+        value.await;
+        println!("!!!!!!0");
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
 }
 
 #[derive(Debug, Clone)]
@@ -91,11 +122,11 @@ fn test_asserts() {
 
     let mut all = Allocator::new(100 * 1024 * 1024);
     all.register(mgr.clone(), 1024 * 1024, 10 * 1024 * 1024);
-    all.auto_collect(AsyncRuntime::Multi(rt.clone()), 5000);
+    all.auto_collect(rt.clone(), 5000);
 
-    rt.spawn(rt.alloc(), async move {
+    rt.spawn(async move {
         for index in 0..10 {
-            if let Some(buf) = mgr.insert(index, TestBin(Arc::new(vec![index as u8]))) {
+            if let Ok(buf) = mgr.insert(index, TestBin(Arc::new(vec![index as u8]))) {
                 println!("!!!!!!load ok, index: {:?}, buf: {:?}", index, buf.0.as_slice());
             }
         }
@@ -106,18 +137,25 @@ fn test_asserts() {
 
 #[test]
 fn test_virtual_page_table() {
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
-        let page_table = VirtualPageTable::new(rt_copy.clone(), "./page_table", 1, 32 * 1024 * 1024, 8192, true, 1).await;
+    rt.spawn(async move {
+        let page_table =
+            VirtualPageTable::new(rt_copy.clone(),
+                                  "./page_table",
+                                  1,
+                                  32 * 1024 * 1024,
+                                  8192,
+                                  true,
+                                  1)
+                .await;
         let current_page_uid = page_table.current_page_uid() as u128;
         println!("!!!!!!current page uid: {}", current_page_uid);
         for page_id in 1..current_page_uid {
-            if page_table.addressing(&page_id).is_none() {
-                panic!("Test load virtual page table failed, page_id: {}", page_id);
-            }
+            assert!(page_table.addressing(&page_id).is_some());
         }
 
         let location = current_page_uid - 1;
@@ -133,7 +171,7 @@ fn test_virtual_page_table() {
 
         let now = Instant::now();
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location..location + 1000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -146,7 +184,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 1000..location + 2000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -159,7 +197,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 2000..location + 3000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -172,7 +210,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 3000..location + 4000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -185,7 +223,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 4000..location + 5000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -198,7 +236,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 5000..location + 6000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -211,7 +249,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 6000..location + 7000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -224,7 +262,7 @@ fn test_virtual_page_table() {
         });
 
         let page_table_copy = page_table.clone();
-        rt_copy.spawn(rt_copy.alloc(), async move {
+        rt_copy.spawn(async move {
             for index in location + 7000..location + 8000 {
                 let page_id = page_table_copy.alloc_page_uid();
                 if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
@@ -275,11 +313,11 @@ pub struct TestWriteDelta {
 }
 
 impl VirtualPageWriteDelta for TestWriteDelta {
-    type Content = Binary;
+    type Content = Vec<u8>;
 
     fn size(&self) -> usize {
         //返回足够大的写增量大小，整理时会大概率被同步
-        0xffffffff
+        0xffff
     }
 
     fn get_cmd_index(&self) -> u64 {
@@ -303,7 +341,7 @@ impl VirtualPageWriteDelta for TestWriteDelta {
     }
 
     fn inner(self) -> Self::Content {
-        Binary::new(("Hello ".to_string() + self.index.to_string().as_str()).as_bytes().to_vec())
+        ("Hello ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
     }
 }
 
@@ -327,10 +365,10 @@ pub struct TestPageBuf {
 }
 
 impl VirtualPageBuf for TestPageBuf {
-    type Content = Binary;
+    type Content = Vec<u8>;
     type Delta = TestWriteDelta;
-    type Output = Binary;
-    type Bin = Binary;
+    type Output = Vec<u8>;
+    type Bin = Vec<u8>;
 
     fn with_page_type(origin_page_id: PageId,
                       copied_page_id: PageId,
@@ -360,11 +398,11 @@ impl VirtualPageBuf for TestPageBuf {
     }
 
     fn page_size(&self) -> usize {
-        1
+        self.buf.len()
     }
 
     fn read_page(&self) -> Self::Output {
-        Binary::new(self.buf.clone())
+        self.buf.clone()
     }
 
     fn write_page_delta(&mut self, delta: Self::Delta) -> Result<(), String> {
@@ -382,14 +420,14 @@ impl VirtualPageBuf for TestPageBuf {
     }
 
     fn serialize_page(self) -> Self::Bin {
-        Binary::new(self.buf)
+        self.buf
     }
 }
 
 pub struct TestPageBufRelease<
     C: Send + 'static,
     O: Send + 'static,
-    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Clone + Send + Sync + 'static,
+    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Default + Clone + Send + Sync + 'static,
     D: VirtualPageWriteDelta<Content = C>,
     P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
 >(VirtualPageManager<C, O, B, D, P>);
@@ -397,21 +435,22 @@ pub struct TestPageBufRelease<
 impl<
     C: Send + 'static,
     O: Send + 'static,
-    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Clone + Send + Sync + 'static,
+    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Default + Clone + Send + Sync + 'static,
     D: VirtualPageWriteDelta<Content = C>,
     P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
 > SharedPageRelease<C, O, B, D, P> for TestPageBufRelease<C, O, B, D, P> {
     fn release(&self,
-               _page_id: u128,
+               page_id: u128,
                buffer: Arc<PageBuffer<C, O, B, D, P>>,
                guard: GarbageGuard<SharedPageBuffer<C, O, B, D, P>>) -> BoxFuture<'static, ()> {
         let manager = self.0.clone();
         async move {
+            println!("======> Release shared page cache, page_id: {:?}", page_id);
             manager
-                .sync_page_buffer(buffer)
+                .sync_page_buffer(buffer, true)
                 .await
                 .unwrap();
-            mem::drop(guard);
+            drop(guard);
         }.boxed()
     }
 }
@@ -419,7 +458,7 @@ impl<
 impl<
     C: Send + 'static,
     O: Send + 'static,
-    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Clone + Send + Sync + 'static,
+    B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Default + Clone + Send + Sync + 'static,
     D: VirtualPageWriteDelta<Content = C>,
     P: VirtualPageBuf<Content = C, Delta = D, Bin = B, Output = O>,
 > TestPageBufRelease<C, O, B, D, P> {
@@ -428,30 +467,29 @@ impl<
     }
 }
 
+// 执行后可以执行test_virtual_page_manager_load_all
 #[test]
-fn test_virtual_page_manager_init() {
+fn test_virtual_page_manager_init () {
     //启动日志系统
     env_logger::builder().format_timestamp_millis().init();
-
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
-    init_global_virtual_page_lfu_cache_allocator::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>(rt.clone(),
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
                                                                                                         10 * 1024 * 1024,
                                                                                                         1024,
                                                                                                         10 * 1024 * 1024,
                                                                                                         5000);
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
-        let device = match SimpleDevice::open(rt_copy.clone(),
-                                              "./device/0.simple",
-                                              None).await {
-            Err(e) => panic!("Open simple device failed, reason: {:?}", e),
-            Ok(device) => device,
-        };
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
 
-        let cache = VirtualPageLFUCache::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>::new();
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
         let page_manager = VirtualPageManagerBuilder::new(1,
                                                           rt_copy.clone(),
                                                           "./page_table",
@@ -463,12 +501,13 @@ fn test_virtual_page_manager_init() {
             .set_table_delay_timeout(1)
             .build()
             .await;
-        if !page_manager.join_device(1, Arc::new(device)) {
-            panic!("Join device failed");
-        }
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
         register_release_handler(1,
-                                 Arc::new(TestPageBufRelease::new(page_manager.clone())));
-        startup_auto_collect(AsyncRuntime::Multi(rt_copy.clone()), 5000);
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
 
         //分配新的页面，并写入分配的页面
         for index in 0..10 {
@@ -488,7 +527,7 @@ fn test_virtual_page_manager_init() {
             cmd.follow_up(TestWriteDelta::new(page_id.clone(),
                                               page_id.clone()));
 
-            match page_manager.write_through(cmd, Some(1000)).await {
+            match page_manager.write_through(cmd, Some(1000), true).await {
                 Err(e) => {
                     panic!("Write through failed, cmd index: {}, reason: {:?}", index, e);
                 },
@@ -502,30 +541,29 @@ fn test_virtual_page_manager_init() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+// 可以在执行test_virtual_page_manager_init后再执行
 #[test]
 fn test_virtual_page_manager_load_all() {
     //启动日志系统
     env_logger::builder().format_timestamp_millis().init();
-
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
-    init_global_virtual_page_lfu_cache_allocator::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>(rt.clone(),
-                                                                                                        10 * 1024 * 1024,
-                                                                                                        1024,
-                                                                                                        10 * 1024 * 1024,
-                                                                                                        5000);
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
-        let device = match SimpleDevice::open(rt_copy.clone(),
-                                              "./device/0.simple",
-                                              None).await {
-            Err(e) => panic!("Open simple device failed, reason: {:?}", e),
-            Ok(device) => device,
-        };
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
 
-        let cache = VirtualPageLFUCache::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>::new();
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
         let page_manager = VirtualPageManagerBuilder::new(1,
                                                           rt_copy.clone(),
                                                           "./page_table",
@@ -537,55 +575,68 @@ fn test_virtual_page_manager_load_all() {
             .set_table_delay_timeout(1)
             .build()
             .await;
-        if !page_manager.join_device(1, Arc::new(device)) {
-            panic!("Join device failed");
-        }
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
         register_release_handler(1,
-                                 Arc::new(TestPageBufRelease::new(page_manager.clone())));
-        startup_auto_collect(AsyncRuntime::Multi(rt_copy.clone()), 5000);
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
 
         //加载虚拟页表中的所有虚拟页
         let mut count = 0;
-        if let Ok(page_ids) = page_manager.load_all().await {
-            for page_id in page_ids {
-                if let Ok(Some(output)) = page_manager.read(None, &page_id).await {
-                    count += 1;
-                    println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
-                             page_id,
-                             String::from_utf8_lossy(output.as_ref()));
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(page_ids) => {
+                for page_id in page_ids {
+                    match page_manager.read(None, &page_id, true).await {
+                        Err(e) => {
+                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                        },
+                        Ok(None) => {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        },
+                        Ok(Some(output)) => {
+                            count += 1;
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                        },
+                    }
                 }
-            }
+                println!("!!!!!!loaded finish, count: {}", count);
+            },
         }
-        println!("!!!!!!loaded finish, count: {}", count);
     });
 
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+// 加载已有页面，并追加新的页面
 #[test]
-fn test_virtual_page_manager_load_write() {
+fn test_virtual_page_manager_load_append() {
     //启动日志系统
     env_logger::builder().format_timestamp_millis().init();
-
+    let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
 
-    init_global_virtual_page_lfu_cache_allocator::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>(rt.clone(),
-                                                                                                        10 * 1024 * 1024,
-                                                                                                        0,
-                                                                                                        10 * 1024 * 1024,
-                                                                                                        5000);
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
 
     let rt_copy = rt.clone();
-    rt.spawn(rt.alloc(), async move {
-        let device = match SimpleDevice::open(rt_copy.clone(),
-                                              "./device/0.simple",
-                                              None).await {
-            Err(e) => panic!("Open simple device failed, reason: {:?}", e),
-            Ok(device) => device,
-        };
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
 
-        let cache = VirtualPageLFUCache::<Binary, Binary, Binary, TestWriteDelta, TestPageBuf>::new();
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
         let page_manager = VirtualPageManagerBuilder::new(1,
                                                           rt_copy.clone(),
                                                           "./page_table",
@@ -597,39 +648,414 @@ fn test_virtual_page_manager_load_write() {
             .set_table_delay_timeout(1)
             .build()
             .await;
-        if !page_manager.join_device(1, Arc::new(device)) {
-            panic!("Join device failed");
-        }
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
         register_release_handler(1,
-                                 Arc::new(TestPageBufRelease::new(page_manager.clone())));
-        startup_auto_collect(AsyncRuntime::Multi(rt_copy.clone()), 5000);
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
 
         //加载虚拟页表中的所有虚拟页
-        if let Ok(page_ids) = page_manager.load_all().await {
-            for page_id in page_ids {
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(page_ids) => {
+                for page_id in page_ids {
+                    match page_manager.read(None, &page_id, true).await {
+                        Err(e) => {
+                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                        },
+                        Ok(None) => {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        },
+                        Ok(Some(output)) => {
+                            count += 1;
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                        },
+                    }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                //初始化写指令
                 let mut cmd = VirtualPageWriteCmd::new();
 
                 //为写指令增加1个增量
-                let new_page_id = page_manager.alloc_page(1, 128);
-                cmd.append(TestWriteDelta::new(new_page_id.clone(),
-                                               new_page_id.clone()));
+                let page_id = page_manager
+                    .alloc_page(1, 16) ;
+                cmd.append(TestWriteDelta::new(page_id.clone(),
+                                               page_id.clone()));
 
                 //为写指令增加1个后续增量
+                let page_id = page_manager.alloc_page(1, 32);
                 cmd.follow_up(TestWriteDelta::new(page_id.clone(),
                                                   page_id.clone()));
 
-                let page_manager_copy = page_manager.clone();
-                rt_copy.spawn(rt_copy.alloc(), async move {
-                    match page_manager_copy.write_through(cmd, None).await {
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 加载已有页面，并更新已有页面
+#[test]
+fn test_virtual_page_manager_load_update() {
+    //启动日志系统
+    env_logger::builder().format_timestamp_millis().init();
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
+
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
+        let page_manager = VirtualPageManagerBuilder::new(1,
+                                                          rt_copy.clone(),
+                                                          "./page_table",
+                                                          cache)
+            .set_init_page_uid(1)
+            .set_table_log_file_limit(32 * 1024 * 1024)
+            .set_table_load_buf_len(8192)
+            .set_pool_buffer_delta_limit(8192)
+            .set_table_delay_timeout(1)
+            .build()
+            .await;
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
+        register_release_handler(1,
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
+
+        //加载虚拟页表中的所有虚拟页
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(mut page_ids) => {
+                page_ids.sort();
+                for page_id in &page_ids {
+                    match page_manager.read(None, page_id, true).await {
                         Err(e) => {
-                            panic!("Write through failed, reason: {:?}", e);
+                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
                         },
-                        Ok(r) => {
-                            println!("!!!!!!Write through ok, cmd index: {}", *r);
+                        Ok(None) => {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        },
+                        Ok(Some(output)) => {
+                            count += 1;
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
                         },
                     }
-                });
-            }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                let mut page_id = PageId::empty();
+                let mut follow_up_page_id = PageId::empty();
+                if count == 0 {
+                    //当前没有页面，则追加页面
+                    page_id = page_manager
+                        .alloc_page(1, 16) ;
+                    follow_up_page_id = page_manager
+                        .alloc_page(1, 32);
+                } else {
+                    //当前有页面
+                    page_id = page_ids[0].clone();
+                    follow_up_page_id = page_ids[1].clone();
+                }
+
+                //初始化写指令
+                let mut cmd = VirtualPageWriteCmd::new();
+
+                //为写指令增加1个增量
+                cmd.append(TestWriteDelta::new(page_id.clone(),
+                                               page_id.clone()));
+
+                //为写指令增加1个后续增量
+                cmd.follow_up(TestWriteDelta::new(follow_up_page_id.clone(),
+                                                  follow_up_page_id.clone()));
+
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 加载已有页面，并写时复制的方式更新已有页面
+// 初始化时使用空页面进行写时复制的更新
+#[test]
+fn test_virtual_page_manager_load_copy_on_write() {
+    //启动日志系统
+    env_logger::builder().format_timestamp_millis().init();
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
+
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
+        let page_manager = VirtualPageManagerBuilder::new(1,
+                                                          rt_copy.clone(),
+                                                          "./page_table",
+                                                          cache)
+            .set_init_page_uid(1)
+            .set_table_log_file_limit(32 * 1024 * 1024)
+            .set_table_load_buf_len(8192)
+            .set_pool_buffer_delta_limit(8192)
+            .set_table_delay_timeout(1)
+            .build()
+            .await;
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
+        register_release_handler(1,
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
+
+        //加载虚拟页表中的所有虚拟页
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(mut page_ids) => {
+                page_ids.sort();
+                for page_id in &page_ids {
+                    match page_manager.read(None, page_id, true).await {
+                        Err(e) => {
+                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                        },
+                        Ok(None) => {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        },
+                        Ok(Some(output)) => {
+                            count += 1;
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                        },
+                    }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                let mut current_page_id = PageId::empty();
+                let mut current_follow_up_page_id = PageId::empty();
+                if count >= 2 {
+                    //当前有页面
+                    current_follow_up_page_id = page_ids.pop().unwrap();
+                    current_page_id = page_ids.pop().unwrap();
+                }
+
+                //初始化写指令
+                let mut cmd = VirtualPageWriteCmd::new();
+
+                //为写指令增加1个增量
+                let new_page_id = page_manager
+                    .alloc_page(1, 16) ;
+                cmd.append(TestWriteDelta::new(current_page_id.clone(),
+                                               new_page_id.clone()));
+
+                //为写指令增加1个后续增量
+                let new_follow_up_page_id = page_manager
+                    .alloc_page(1, 32);
+                cmd.follow_up(TestWriteDelta::new(current_follow_up_page_id.clone(),
+                                                  new_follow_up_page_id.clone()));
+
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 加载已有页面，并写时复制的方式更新已有页面，并释放更新后的原始页面
+// 初始化时使用空页面进行写时复制的更新
+#[test]
+fn test_virtual_page_manager_load_and_copy_on_write_and_free() {
+    //启动日志系统
+    env_logger::builder().format_timestamp_millis().init();
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
+
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
+        let page_manager = VirtualPageManagerBuilder::new(1,
+                                                          rt_copy.clone(),
+                                                          "./page_table",
+                                                          cache)
+            .set_init_page_uid(1)
+            .set_table_log_file_limit(32 * 1024 * 1024)
+            .set_table_load_buf_len(8192)
+            .set_pool_buffer_delta_limit(8192)
+            .set_table_delay_timeout(1)
+            .build()
+            .await;
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
+        register_release_handler(1,
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
+
+        //加载虚拟页表中的所有虚拟页
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(mut page_ids) => {
+                page_ids.sort();
+                for page_id in &page_ids {
+                    match page_manager.read(None, page_id, true).await {
+                        Err(e) => {
+                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                        },
+                        Ok(None) => {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        },
+                        Ok(Some(output)) => {
+                            count += 1;
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                        },
+                    }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                let mut current_page_id = PageId::empty();
+                let mut current_follow_up_page_id = PageId::empty();
+                if count >= 2 {
+                    //当前有页面
+                    current_follow_up_page_id = page_ids.pop().unwrap();
+                    current_page_id = page_ids.pop().unwrap();
+                }
+
+                //初始化写指令
+                let mut cmd = VirtualPageWriteCmd::new();
+
+                //为写指令增加1个增量
+                let new_page_id = page_manager
+                    .alloc_page(1, 16) ;
+                cmd.append(TestWriteDelta::new(current_page_id.clone(),
+                                               new_page_id.clone()));
+
+                //为写指令增加1个后续增量
+                let new_follow_up_page_id = page_manager
+                    .alloc_page(1, 32);
+                cmd.follow_up(TestWriteDelta::new(current_follow_up_page_id.clone(),
+                                                  new_follow_up_page_id.clone()));
+
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+
+                        if !current_page_id.is_empty()
+                            && !current_follow_up_page_id.is_empty() {
+                            //原始页面不是空页面，则立即释放原始页面
+                            let r0 = page_manager.free_page(current_page_id.clone());
+                            let r1 = page_manager.free_page(current_follow_up_page_id.clone());
+                            if r0 && r1 {
+                                println!("!!!!!!Free page ok, current_page_id: {:?}, current_follow_up_page_id: {:?}",
+                                         current_page_id,
+                                         current_follow_up_page_id);
+                            } else {
+                                println!("!!!!!!Free page failed, current_page_id: {:?}/{:?}, current_follow_up_page_id: {:?}/{:?}, ",
+                                         current_page_id,
+                                         r0,
+                                         current_follow_up_page_id,
+                                         r1);
+                            }
+                        }
+                    },
+                }
+            },
         }
     });
 

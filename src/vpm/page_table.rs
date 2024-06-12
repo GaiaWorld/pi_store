@@ -12,10 +12,15 @@ use log::{debug, error};
 
 use pi_hash::XHashMap;
 use pi_async_rt::{lock::spin_lock::SpinLock,
-              rt::multi_thread::MultiTaskRuntime};
+                  rt::multi_thread::MultiTaskRuntime};
 
 use crate::{log_store::log_file::{PairLoader, LogMethod, LogFile},
             vpm::EMPTY_PAGE};
+
+///
+/// 超级页的页ID
+///
+const SUPER_PAGE_ID: u128 = 0;
 
 ///
 /// 可分配的最大页面唯一id
@@ -99,7 +104,7 @@ impl VirtualPageTable {
         let page_uid = self.0.page_uid_allocator.fetch_add(1, Ordering::Relaxed);
         drop(locked);
 
-        if page_uid > MAX_PAGE_UID {
+        if page_uid == MAX_PAGE_UID {
             //达到可分配的页面唯一id限制，则立即抛出异常
             panic!("Alloc page uid failed, reason: out of limit");
         }
@@ -110,7 +115,7 @@ impl VirtualPageTable {
     /// 获取指定页面id所指定的块设备中的块位置
     pub fn addressing(&self, page_id: &u128) -> Option<u64> {
         if let Some(location) = self.0.map.get(page_id) {
-            Some(location.value().load(Ordering::Relaxed))
+            Some(location.value().load(Ordering::Acquire))
         } else {
             None
         }
@@ -274,12 +279,12 @@ impl VirtualPageTable {
         let last_log_uid = {
             let mut locked = self.0.wait_flush.lock();
 
-            //更新当前虚拟页表的元信息
+            //更新当前虚拟页表的元信息到超级页
             let log_uid = self
                 .0
                 .file
                 .append(LogMethod::PlainAppend,
-                        0u128.to_le_bytes().as_slice(),
+                        SUPER_PAGE_ID.to_le_bytes().as_slice(),
                         self.current_page_uid().to_le_bytes().as_slice()); //写入虚拟页表文件的缓冲区
             locked.push(log_uid); //将等待刷新的日志id写入等待刷新列表中
 
@@ -287,10 +292,11 @@ impl VirtualPageTable {
             locked.pop().unwrap()
         };
 
+        let timeout = Some(self.0.delay_timeout);
         if let Err(e) = self.0.file.commit(last_log_uid,
-                                 true,
-                                 false,
-                                 None).await {
+                                           true,
+                                           false,
+                                           timeout).await {
             //刷新失败，则还原等待刷新的日志id，并返回错误原因
             error!("Flush virtual page table failed, last_log_uid: {:?}, reason: {:?}",
                 last_log_uid,
@@ -350,7 +356,7 @@ impl PairLoader for VirtualPageTableLoader {
             //插入或更新指定页面id的值
             let id = u128::from_le_bytes(key.as_slice().try_into().unwrap());
             if id == 0 {
-                //关键字为0
+                //加载元信息
                 if !self.is_inited {
                     //未加载虚拟页表的元信息，则立即加载
                     self.is_inited = true;
@@ -362,7 +368,7 @@ impl PairLoader for VirtualPageTableLoader {
                                Ordering::Relaxed);
                 }
             } else {
-                //页面id不为0
+                //加载页面
                 if let Some(path) = log_file {
                     match self.statistics.entry(path.clone()) {
                         HashMapEntry::Occupied(mut o) => {
@@ -378,9 +384,16 @@ impl PairLoader for VirtualPageTableLoader {
                     }
                 }
 
-                //加载到虚拟页表中
-                self.table.0.map.insert(id,
-                                        AtomicU64::new(u64::from_le_bytes(value.as_slice().try_into().unwrap())));
+                let location = u64::from_le_bytes(value.as_slice().try_into().unwrap());
+                println!("!!!!!!> page: {:?}, location: {:?}", id, location);
+                if location != 0 {
+                    //当前页面未被释放，则加载到虚拟页表中
+                    self.table.0.map.insert(id,
+                                            AtomicU64::new(u64::from_le_bytes(value.as_slice().try_into().unwrap())));
+                } else {
+                    //当前页面已释放，则不需要加载到虚拟页表中，并记录到已删除页面id表中
+                    self.removed.insert(key, ());
+                }
             }
         } else {
             //删除指定页面id的值，则不需要加载到虚拟页表中，并记录到已删除页面id表中

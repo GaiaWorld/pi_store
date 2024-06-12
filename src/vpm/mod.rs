@@ -36,13 +36,13 @@ const EMPTY_WRITE_INDEX: u64 = 0;
 pub trait VirtualPageWriteDelta: Send + 'static {
     type Content: Send + Sized + 'static;  //写增量内容
 
-    /// 获取写增量的大小，单位字节
+    /// 获取写增量的大小，不允许比实际写增量小，单位字节
     fn size(&self) -> usize;
 
     /// 获取写增量所在写指令的编号
     fn get_cmd_index(&self) -> u64;
 
-    /// 设置写增量所在写指令的编号
+    /// 设置写增量所在写指令的编号，外部应该保证在运行时写指令的编号是唯一且递增的
     fn set_cmd_index(&mut self, cmd_index: u64);
 
     /// 获取写增量对应的原始的虚拟页的唯一id
@@ -109,7 +109,9 @@ pub trait VirtualPageBuf: Clone + Send + Sync + 'static {
 
 ///
 /// 页面id，是指向虚拟块地址的指针
-/// 页面id的最高位字节，作为块设备号，即虚拟页管理器支持最多挂载255个块设备，0号设备为当前虚拟页管理器
+/// 页面id的最高32位，作为虚拟页管理器的唯一ID
+/// 页面id的次高32位，作为块设备号，即一个虚拟页管理器支持最多挂载65535个块设备，0号设备为当前虚拟页管理器
+/// 页面id的最低64位，即页表分配的虚拟页id
 /// 页面id分配后，将不会改变，只会在确认释放后被回收
 ///
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,12 +276,12 @@ impl<
 
     /// 获取当前写指令的编号
     pub fn get_index(&self) -> u64 {
-        self.0.index.load(Ordering::Relaxed)
+        self.0.index.load(Ordering::Acquire)
     }
 
     /// 设置当前写指令的编号
     pub fn set_index(&mut self, index: u64) {
-        self.0.index.store(index, Ordering::Relaxed);
+        self.0.index.store(index, Ordering::Release);
     }
 
     /// 从写指令的写增量队列头弹出一个写增量，写增量队列为空，则返回空
@@ -299,6 +301,9 @@ impl<
     }
 
     /// 追加指定的虚拟页写增量到虚拟页写指令的写增量队列
+    /// 当写增量的原始的虚拟页的唯一id等于复制的虚拟页的唯一id，则表示增量只作用于原始的虚拟页
+    /// 当写增量的原始的虚拟页的唯一id不等于复制的虚拟页的唯一id，则表示将原始的虚拟页的内容完整复制到复制的虚拟页上，再将增量作用于复制的虚拟页
+    /// 所以原始的虚拟页的唯一id为0且复制的虚拟页的唯一id大于0，则表示增量作用直接作用于复制的虚拟页，原始的虚拟页为空
     pub fn append(&self, mut delta: D) {
         //追加写增量
         self
@@ -329,6 +334,9 @@ impl<
 
     /// 追加指定的虚拟页写增量到虚拟页写指令的后续写增量队列
     /// 后续写增量队列中的写增量会在写增量队列全部执行完成后，再执行
+    /// 当写增量的原始的虚拟页的唯一id等于复制的虚拟页的唯一id，则表示增量只作用于原始的虚拟页
+    /// 当写增量的原始的虚拟页的唯一id不等于复制的虚拟页的唯一id，则表示将原始的虚拟页的内容完整复制到复制的虚拟页上，再将增量作用于复制的虚拟页
+    /// 所以原始的虚拟页的唯一id为0且复制的虚拟页的唯一id大于0，则表示增量作用直接作用于复制的虚拟页，原始的虚拟页为空
     pub fn follow_up(&self, mut delta: D) {
         //追加写增量
         self
