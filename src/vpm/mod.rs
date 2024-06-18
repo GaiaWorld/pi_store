@@ -20,9 +20,9 @@ pub mod page_cache;
 pub const EMPTY_PAGE: u128 = 0;
 
 ///
-/// 虚拟页管理器的块设备编号，即虚拟页管理器是一个无法持久化的默认块设备
+/// 虚拟页管理器的块设备编号，即虚拟页管理器是一个默认块设备
 ///
-const VIRTUAL_PAGE_MANAGER_DEVICES_INDEX: u8 = 0;
+const VIRTUAL_PAGE_MANAGER_DEVICES_INDEX: u32 = 0;
 
 ///
 /// 写指令的空编号，用于表示不存在或不可用的写指令
@@ -110,12 +110,12 @@ pub trait VirtualPageBuf: Clone + Send + Sync + 'static {
 ///
 /// 页面id，是指向虚拟块地址的指针
 /// 页面id的最高32位，作为虚拟页管理器的唯一ID
-/// 页面id的次高32位，作为块设备号，即一个虚拟页管理器支持最多挂载65535个块设备，0号设备为当前虚拟页管理器
+/// 页面id的次高32位，作为块设备号，即一个虚拟页管理器支持最多挂载0xffffffff个块设备，0号设备为当前虚拟页管理器
 /// 页面id的最低64位，即页表分配的虚拟页id
 /// 页面id分配后，将不会改变，只会在确认释放后被回收
 ///
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PageId(u128);
+pub struct PageId(pub(crate) u128);
 
 unsafe impl Send for PageId {}
 unsafe impl Sync for PageId {}
@@ -163,6 +163,27 @@ impl PageId {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.0 == EMPTY_PAGE
+    }
+
+    /// 判断是否是保留页
+    #[inline]
+    pub fn is_reserved(&self) -> bool {
+        self.owner_uid() == 0
+            && self.device_offset() == 0
+    }
+
+    /// 判断是否是内部页
+    #[inline]
+    pub fn is_internal(&self) -> bool {
+        self.owner_uid() > 0
+            && self.device_offset() == 0
+    }
+
+    /// 判断是否是普通页
+    #[inline]
+    pub fn is_normal(&self) -> bool {
+        self.owner_uid() > 0
+            && self.device_offset() > 0
     }
 
     /// 获取页面所属的虚拟页管理器的唯一id
@@ -304,7 +325,18 @@ impl<
     /// 当写增量的原始的虚拟页的唯一id等于复制的虚拟页的唯一id，则表示增量只作用于原始的虚拟页
     /// 当写增量的原始的虚拟页的唯一id不等于复制的虚拟页的唯一id，则表示将原始的虚拟页的内容完整复制到复制的虚拟页上，再将增量作用于复制的虚拟页
     /// 所以原始的虚拟页的唯一id为0且复制的虚拟页的唯一id大于0，则表示增量作用直接作用于复制的虚拟页，原始的虚拟页为空
-    pub fn append(&self, mut delta: D) {
+    pub fn append(&self, delta: D) {
+        let origin_page_id = delta.get_origin_page_id();
+        let copied_page_id = delta.get_copied_page_id();
+        if (origin_page_id.is_internal()
+            || copied_page_id.is_internal())
+            && (origin_page_id != copied_page_id) {
+            //原始的虚拟页或复制的虚拟页中有任意一个是内部页，且原始的虚拟页与复制的虚拟页不等，则立即抛出异常
+            panic!("Follow up failed, origin_page_id: {:?}, copied_page_id: {:?}, reason: the internal page id must be the same",
+                   origin_page_id,
+                   copied_page_id);
+        }
+
         //追加写增量
         self
             .0
@@ -337,7 +369,18 @@ impl<
     /// 当写增量的原始的虚拟页的唯一id等于复制的虚拟页的唯一id，则表示增量只作用于原始的虚拟页
     /// 当写增量的原始的虚拟页的唯一id不等于复制的虚拟页的唯一id，则表示将原始的虚拟页的内容完整复制到复制的虚拟页上，再将增量作用于复制的虚拟页
     /// 所以原始的虚拟页的唯一id为0且复制的虚拟页的唯一id大于0，则表示增量作用直接作用于复制的虚拟页，原始的虚拟页为空
-    pub fn follow_up(&self, mut delta: D) {
+    pub fn follow_up(&self, delta: D) {
+        let origin_page_id = delta.get_origin_page_id();
+        let copied_page_id = delta.get_copied_page_id();
+        if (origin_page_id.is_internal()
+            || copied_page_id.is_internal())
+            && (origin_page_id != copied_page_id) {
+            //原始的虚拟页或复制的虚拟页中有任意一个是内部页，且原始的虚拟页与复制的虚拟页不等，则立即抛出异常
+            panic!("Follow up failed, origin_page_id: {:?}, copied_page_id: {:?}, reason: the internal page id must be the same",
+                   origin_page_id,
+                   copied_page_id);
+        }
+
         //追加写增量
         self
             .0

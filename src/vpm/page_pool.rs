@@ -311,7 +311,11 @@ impl<
                                   loading: BoxFuture<'static, Result<PageBuffer<C, O, B, D, P>>>,
                                   loaded: Box<dyn Fn(&PageBuffer<C, O, B, D, P>) + Send + 'static>)
         -> Result<Arc<PageBuffer<C, O, B, D, P>>> {
-        self.0.cache.load(page_id, loading, loaded).await
+        self
+            .0
+            .cache
+            .load(page_id, loading, loaded)
+            .await
     }
 }
 

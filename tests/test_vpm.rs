@@ -147,6 +147,7 @@ fn test_virtual_page_table() {
             VirtualPageTable::new(rt_copy.clone(),
                                   "./page_table",
                                   1,
+                                  0,
                                   32 * 1024 * 1024,
                                   8192,
                                   true,
@@ -155,7 +156,7 @@ fn test_virtual_page_table() {
         let current_page_uid = page_table.current_page_uid() as u128;
         println!("!!!!!!current page uid: {}", current_page_uid);
         for page_id in 1..current_page_uid {
-            assert!(page_table.addressing(&page_id).is_some());
+            assert!(page_table.addressing(&page_id.into()).is_some());
         }
 
         let location = current_page_uid - 1;
@@ -174,7 +175,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location..location + 1000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender0.send(None);
                     return;
                 }
@@ -187,7 +188,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 1000..location + 2000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender1.send(None);
                     return;
                 }
@@ -200,7 +201,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 2000..location + 3000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender2.send(None);
                     return;
                 }
@@ -213,7 +214,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 3000..location + 4000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender3.send(None);
                     return;
                 }
@@ -226,7 +227,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 4000..location + 5000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender4.send(None);
                     return;
                 }
@@ -239,7 +240,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 5000..location + 6000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender5.send(None);
                     return;
                 }
@@ -252,7 +253,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 6000..location + 7000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender6.send(None);
                     return;
                 }
@@ -265,7 +266,7 @@ fn test_virtual_page_table() {
         rt_copy.spawn(async move {
             for index in location + 7000..location + 8000 {
                 let page_id = page_table_copy.alloc_page_uid();
-                if let Some(_) = page_table_copy.register(page_id as u128, index as u64) {
+                if let Some(_) = page_table_copy.register((page_id as u128).into(), index as u64) {
                     sender7.send(None);
                     return;
                 }
@@ -310,6 +311,7 @@ pub struct TestWriteDelta {
     index:          u64,
     page_id:        PageId,
     copy_page_id:   PageId,
+    delta_type:     usize,
 }
 
 impl VirtualPageWriteDelta for TestWriteDelta {
@@ -337,21 +339,40 @@ impl VirtualPageWriteDelta for TestWriteDelta {
     }
 
     fn get_type(&self) -> usize {
-        1
+        self.delta_type
     }
 
     fn inner(self) -> Self::Content {
-        ("Hello ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
+        match self.get_type() {
+            1 => {
+                ("Hello ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
+            },
+            _ => {
+                ("This is super block ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
+            }
+        }
     }
 }
 
 impl TestWriteDelta {
     pub fn new(page_id: PageId,
                copy_page_id: PageId) -> Self {
-        TestWriteDelta {
-            index: 0,
-            page_id,
-            copy_page_id,
+        if copy_page_id.is_normal() {
+            TestWriteDelta {
+                index: 0,
+                page_id,
+                copy_page_id,
+                delta_type: 1,
+            }
+        } else if copy_page_id.is_internal() {
+            TestWriteDelta {
+                index: 0,
+                page_id,
+                copy_page_id,
+                delta_type: 2
+            }
+        } else {
+            unimplemented!()
         }
     }
 }
@@ -522,10 +543,10 @@ fn test_virtual_page_manager_init () {
                                                page_id.clone()));
             }
 
-            //为写指令增加1个后续增量
-            let page_id = page_manager.alloc_page(1, 32);
-            cmd.follow_up(TestWriteDelta::new(page_id.clone(),
-                                              page_id.clone()));
+            //为写指令增加1个后续增量，后续增量写入分配的内部页
+            let super_page_id = page_manager.alloc_page(0, 32);
+            cmd.follow_up(TestWriteDelta::new(super_page_id.clone(),
+                                              super_page_id.clone()));
 
             match page_manager.write_through(cmd, Some(1000), true).await {
                 Err(e) => {
@@ -591,19 +612,30 @@ fn test_virtual_page_manager_load_all() {
             },
             Ok(page_ids) => {
                 for page_id in page_ids {
-                    match page_manager.read(None, &page_id, true).await {
-                        Err(e) => {
-                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
-                        },
-                        Ok(None) => {
-                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
-                        },
-                        Ok(Some(output)) => {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                count += 1;
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
                             count += 1;
                             println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
                                      page_id,
                                      String::from_utf8_lossy(output.as_ref()));
-                        },
+                        }
+                    } else {
+                        unimplemented!()
                     }
                 }
                 println!("!!!!!!loaded finish, count: {}", count);
@@ -664,19 +696,30 @@ fn test_virtual_page_manager_load_append() {
             },
             Ok(page_ids) => {
                 for page_id in page_ids {
-                    match page_manager.read(None, &page_id, true).await {
-                        Err(e) => {
-                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
-                        },
-                        Ok(None) => {
-                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
-                        },
-                        Ok(Some(output)) => {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                count += 1;
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
                             count += 1;
                             println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
                                      page_id,
                                      String::from_utf8_lossy(output.as_ref()));
-                        },
+                        }
+                    } else {
+                        unimplemented!()
                     }
                 }
                 println!("!!!!!!loaded finish, count: {}", count);
@@ -690,10 +733,10 @@ fn test_virtual_page_manager_load_append() {
                 cmd.append(TestWriteDelta::new(page_id.clone(),
                                                page_id.clone()));
 
-                //为写指令增加1个后续增量
-                let page_id = page_manager.alloc_page(1, 32);
-                cmd.follow_up(TestWriteDelta::new(page_id.clone(),
-                                                  page_id.clone()));
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
+                let super_page_id = page_manager.alloc_page(0, 32);
+                cmd.follow_up(TestWriteDelta::new(super_page_id.clone(),
+                                                  super_page_id.clone()));
 
                 match page_manager.write_through(cmd, Some(1000), true).await {
                     Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
@@ -764,19 +807,30 @@ fn test_virtual_page_manager_load_update() {
             Ok(mut page_ids) => {
                 page_ids.sort();
                 for page_id in &page_ids {
-                    match page_manager.read(None, page_id, true).await {
-                        Err(e) => {
-                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
-                        },
-                        Ok(None) => {
-                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
-                        },
-                        Ok(Some(output)) => {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                count += 1;
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(page_id) {
                             count += 1;
                             println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
                                      page_id,
                                      String::from_utf8_lossy(output.as_ref()));
-                        },
+                        }
+                    } else {
+                        unimplemented!()
                     }
                 }
                 println!("!!!!!!loaded finish, count: {}", count);
@@ -788,7 +842,7 @@ fn test_virtual_page_manager_load_update() {
                     page_id = page_manager
                         .alloc_page(1, 16) ;
                     follow_up_page_id = page_manager
-                        .alloc_page(1, 32);
+                        .alloc_page(0, 32);
                 } else {
                     //当前有页面
                     page_id = page_ids[0].clone();
@@ -802,7 +856,7 @@ fn test_virtual_page_manager_load_update() {
                 cmd.append(TestWriteDelta::new(page_id.clone(),
                                                page_id.clone()));
 
-                //为写指令增加1个后续增量
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
                 cmd.follow_up(TestWriteDelta::new(follow_up_page_id.clone(),
                                                   follow_up_page_id.clone()));
 
@@ -874,32 +928,40 @@ fn test_virtual_page_manager_load_copy_on_write() {
                 println!("!!!!!!loaded failed, reason: {:?}", e);
             },
             Ok(mut page_ids) => {
+                let mut current_page_id = PageId::empty();
+
                 page_ids.sort();
-                for page_id in &page_ids {
-                    match page_manager.read(None, page_id, true).await {
-                        Err(e) => {
-                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
-                        },
-                        Ok(None) => {
-                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
-                        },
-                        Ok(Some(output)) => {
-                            count += 1;
+                for page_id in page_ids {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                                count += 1;
+                                current_page_id = page_id;
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
                             println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
                                      page_id,
                                      String::from_utf8_lossy(output.as_ref()));
-                        },
+                            count += 1;
+                        } else {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        }
+                    } else {
+                        unimplemented!()
                     }
                 }
                 println!("!!!!!!loaded finish, count: {}", count);
-
-                let mut current_page_id = PageId::empty();
-                let mut current_follow_up_page_id = PageId::empty();
-                if count >= 2 {
-                    //当前有页面
-                    current_follow_up_page_id = page_ids.pop().unwrap();
-                    current_page_id = page_ids.pop().unwrap();
-                }
 
                 //初始化写指令
                 let mut cmd = VirtualPageWriteCmd::new();
@@ -910,10 +972,10 @@ fn test_virtual_page_manager_load_copy_on_write() {
                 cmd.append(TestWriteDelta::new(current_page_id.clone(),
                                                new_page_id.clone()));
 
-                //为写指令增加1个后续增量
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
                 let new_follow_up_page_id = page_manager
-                    .alloc_page(1, 32);
-                cmd.follow_up(TestWriteDelta::new(current_follow_up_page_id.clone(),
+                    .alloc_page(0, 32);
+                cmd.follow_up(TestWriteDelta::new(new_follow_up_page_id.clone(),
                                                   new_follow_up_page_id.clone()));
 
                 match page_manager.write_through(cmd, Some(1000), true).await {
@@ -984,32 +1046,42 @@ fn test_virtual_page_manager_load_and_copy_on_write_and_free() {
                 println!("!!!!!!loaded failed, reason: {:?}", e);
             },
             Ok(mut page_ids) => {
+                let mut current_page_id = PageId::empty();
+                let mut current_follow_up_page_id = PageId::empty();
+
                 page_ids.sort();
-                for page_id in &page_ids {
-                    match page_manager.read(None, page_id, true).await {
-                        Err(e) => {
-                            println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
-                        },
-                        Ok(None) => {
-                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
-                        },
-                        Ok(Some(output)) => {
-                            count += 1;
+                for page_id in page_ids {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                                count += 1;
+                                current_page_id = page_id;
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
                             println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
                                      page_id,
                                      String::from_utf8_lossy(output.as_ref()));
-                        },
+                            count += 1;
+                            current_follow_up_page_id = page_id;
+                        } else {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        }
+                    } else {
+                        unimplemented!()
                     }
                 }
                 println!("!!!!!!loaded finish, count: {}", count);
-
-                let mut current_page_id = PageId::empty();
-                let mut current_follow_up_page_id = PageId::empty();
-                if count >= 2 {
-                    //当前有页面
-                    current_follow_up_page_id = page_ids.pop().unwrap();
-                    current_page_id = page_ids.pop().unwrap();
-                }
 
                 //初始化写指令
                 let mut cmd = VirtualPageWriteCmd::new();
@@ -1020,10 +1092,10 @@ fn test_virtual_page_manager_load_and_copy_on_write_and_free() {
                 cmd.append(TestWriteDelta::new(current_page_id.clone(),
                                                new_page_id.clone()));
 
-                //为写指令增加1个后续增量
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
                 let new_follow_up_page_id = page_manager
-                    .alloc_page(1, 32);
-                cmd.follow_up(TestWriteDelta::new(current_follow_up_page_id.clone(),
+                    .alloc_page(0, 32);
+                cmd.follow_up(TestWriteDelta::new(new_follow_up_page_id.clone(),
                                                   new_follow_up_page_id.clone()));
 
                 match page_manager.write_through(cmd, Some(1000), true).await {

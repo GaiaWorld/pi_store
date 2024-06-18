@@ -18,16 +18,40 @@ use pi_async_rt::rt::{AsyncRuntime,
                       multi_thread::MultiTaskRuntime};
 use pi_guid::Guid;
 
-use crate::vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId, VirtualPageWriteCmd, WriteIndex,
+use crate::vpm::{EMPTY_PAGE, VIRTUAL_PAGE_MANAGER_DEVICES_INDEX, VirtualPageWriteDelta, VirtualPageBuf, PageId, VirtualPageWriteCmd, WriteIndex,
                  page_cache::{VirtualPageLFUCache, VirtualPageLFUCacheDirtyIterator},
-                 page_table::VirtualPageTable,
+                 page_table::{VirtualPageTable, VirtualPageTableIteratorItem},
                  page_pool::{VirtualPageCachingStrategy, VirtualPageBufferPool, PageBuffer}};
 use crate::devices::{EMPTY_BLOCK, EMPTY_BLOCK_LOCATION, DeviceDetail, DeviceValueType, DeviceDetailMap, DeviceStatus, BlockDevice, BlockLocation, WriteOption};
+
+///
+/// 保留的虚拟页管理器唯一ID
+///
+const RESERVED_VIRTUAL_PAGE_MANAGER_UID: u32 = 0;
+
+///
+/// 保留的最小虚拟页唯一ID，一般用于表示空页，或在页表持久化中用于表示超级页
+/// 即虚拟页管理器唯一ID为0，块设备编号为0，页ID为0
+/// 注意与虚拟页管理器的内部最小虚拟页唯一ID区分，内部最小虚拟页唯一ID的虚拟页管理器唯一ID不为0但块设备编号为0，页ID也为0
+///
+const RESERVED_MIN_PAGE_UID: PageId = PageId(EMPTY_PAGE);
+
+///
+/// 保留的最大虚拟页唯一ID
+/// 即虚拟页管理器唯一ID为0，块设备编号为0，页ID为0xffffffffffffffff
+/// 注意与虚拟页管理器的内部最大虚拟页唯一ID区分，内部最大虚拟页唯一ID的虚拟页管理器唯一ID不为0但块设备编号为0，页ID为0xffffffffffffffff
+///
+const RESERVED_MAX_PAGE_UID: PageId = PageId(u64::MAX as u128);
 
 ///
 /// 默认的初始虚拟页唯一id
 ///
 const DEFAULT_INIT_PAGE_UID: u64 = 1;
+
+///
+/// 默认的初始内部虚拟页唯一id
+///
+const DEFAULT_INIT_INTERNAL_PAGE_UID: u64 = 0;
 
 ///
 /// 默认的虚拟页表的日志文件大小限制，单位B
@@ -90,6 +114,7 @@ pub struct VirtualPageManagerBuilder<
     rt:                     MultiTaskRuntime<()>,                                           //运行时
     table_path:             PathBuf,                                                        //虚拟页的路径
     init_page_uid:          u64,                                                            //初始虚拟页唯一id
+    init_inner_page_uid:    u64,                                                            //初始内部虚拟页唯一id
     table_log_file_limit:   usize,                                                          //虚拟页表的日志文件大小限制，单位B
     table_load_buf_len:     u64,                                                            //虚拟页表的加载缓冲区大小，单位B
     table_delay_timeout:    usize,                                                          //虚拟页表的延迟同步间隔时长，单位ms
@@ -121,6 +146,10 @@ impl<
                                 rt: MultiTaskRuntime<()>,
                                 path: Pa,
                                 cache: M) -> Self {
+        if uid == RESERVED_VIRTUAL_PAGE_MANAGER_UID {
+            panic!("Create VirtualPageManagerBuilder failed, reason: uid must be greater than 0");
+        }
+
         let table_path = path.as_ref().to_path_buf();
 
         VirtualPageManagerBuilder {
@@ -128,6 +157,7 @@ impl<
             rt,
             table_path,
             init_page_uid: DEFAULT_INIT_PAGE_UID,
+            init_inner_page_uid: DEFAULT_INIT_INTERNAL_PAGE_UID,
             table_log_file_limit: DEFAULT_TABLE_LOG_FILE_LIMIT,
             table_load_buf_len: DEFAULT_TABLE_LOAD_BUF_LEN,
             table_delay_timeout: DEFAULT_TABLE_DELAY_TIMEOUT,
@@ -199,6 +229,7 @@ impl<
         let table = VirtualPageTable::new(rt.clone(),
                                           self.table_path,
                                           self.init_page_uid,
+                                          self.init_inner_page_uid,
                                           self.table_log_file_limit,
                                           self.table_load_buf_len,
                                           true,
@@ -395,6 +426,8 @@ impl<
     }
 
     /// 同步非阻塞的分配指定大小的页，在指定块设备上为页保留指定大小的分配块空间，并延迟到访问页时再提交分配，
+    /// 当offset为0，则表示分配的是内部页，内部页不需要指定size, 也不会从块设备中分配块，数据将直接存储在页中，
+    /// 内部页id的虚拟页管理器唯一ID为当前虚拟页管理器的唯一ID，块设备编号为0，页id从0到0xffffffffffffffff
     /// 返回非空页id，分配0大小的页则返回空页id，
     /// 分配虚拟页唯一id失败则立即抛出异常
     pub fn alloc_page(&self,
@@ -405,64 +438,95 @@ impl<
             return PageId::empty();
         }
 
-        let page_id = create_page_id(self.0.uid,
-                                     offset,
-                                     self.0.table.alloc_page_uid());
-        if let Some(_) = register_page(&self.0.table,
-                                       page_id.clone(),
-                                       EMPTY_BLOCK_LOCATION) {
-            //不允许注册已存在的虚拟页
-            panic!("Lazy alloc page failed, page_id: {:?}, reason: conflict page", page_id);
-        }
+        if offset == 0 {
+            //分配内部页
+            create_page_id(self.0.uid,
+                           offset,
+                           self.0.table.alloc_internal_page_uid())
+        } else {
+            //分配普通页
+            let page_id = create_page_id(self.0.uid,
+                           offset,
+                           self.0.table.alloc_page_uid());
 
-        if let Some(_) = register_reserved_page(&self.0.reserved,
-                                                page_id.clone(),
-                                                size) {
-            //不允许注册已存在的保留的虚拟页
-            panic!("Lazy alloc page failed, page_id: {:?}, reason: conflict reserved page", page_id);
-        }
+            if let Some(_) = register_page(&self.0.table,
+                                           page_id.clone(),
+                                           EMPTY_BLOCK_LOCATION) {
+                //不允许注册已存在的虚拟页
+                panic!("Lazy alloc page failed, page_id: {:?}, reason: conflict page", page_id);
+            }
 
-        page_id
+            if let Some(_) = register_reserved_page(&self.0.reserved,
+                                                    page_id.clone(),
+                                                    size) {
+                //不允许注册已存在的保留的虚拟页
+                panic!("Lazy alloc page failed, page_id: {:?}, reason: conflict reserved page", page_id);
+            }
+
+            page_id
+        }
+    }
+
+    /// 同步非阻塞的读指定内部虚拟页
+    pub fn read_internal(&self, page_id: &PageId) -> Option<Vec<u8>> {
+        self
+            .0
+            .table
+            .read_internal_page(page_id)
     }
 
     /// 同步非阻塞的释放指定的虚拟页，将虚拟页表中指定页id对应的块位置设置为空块，并通知对应的块设备释放指定的块位置
     /// 实际的释放，将延迟到虚拟页表整理和块设备整理时
     pub fn free_page(&self, page_id: PageId) -> bool {
-        if page_id.is_empty() || !self.0.table.contains_page(page_id.as_ref()) {
-            //忽略空页或不存在的页的释放
+        if page_id.is_empty()
+            || (page_id.is_normal()
+            && !self.0.table.contains_page(page_id.as_ref())) {
+            //忽略空页或不存在的普通页的释放
             return true;
         }
 
-        //同步标记指定虚拟页已释放
-        let location = if let Some(old_location) = self.0.table.addressing(page_id.as_ref()) {
-            //指定页id的块位置存在，则将块位置设置为空块
-            if let Err(_) = self.0.table.update_location(page_id.as_ref(),
-                                                         old_location,
-                                                         EMPTY_BLOCK) {
-                //释放失败
-                return false;
+        if page_id.is_normal() {
+            //虚拟页是普通页，同步标记指定虚拟页已释放
+            let location = if let Some(old_location) = self.0.table.addressing(&page_id) {
+                //指定页id的块位置存在，则将块位置设置为空块
+                if let Err(_) = self.0.table.update_location(&page_id,
+                                                             old_location,
+                                                             EMPTY_BLOCK) {
+                    //释放失败
+                    return false;
+                }
+
+                BlockLocation::new(old_location)
+            } else {
+                //指定的虚拟页不存在
+                EMPTY_BLOCK_LOCATION
+            };
+
+            if location.is_empty() {
+                //忽略空块的释放
+                return true;
             }
 
-            BlockLocation::new(old_location)
+            //异步释放指定块设备的指定块
+            let offset = page_id.device_offset();
+            let devices = self.0.devices.clone();
+            let _ = self.0.rt.spawn(async move {
+                if let Some(device) = devices.get(&offset) {
+                    //指定位置的块设备存在，则释放指定的块
+                    device.free_block(&location).await;
+                }
+            });
+        } else if page_id.is_internal() {
+            //虚拟页是内部页
+            let _ = self
+                .0
+                .table
+                .write_internal_page(page_id,
+                                     &EMPTY_BLOCK.to_le_bytes());
         } else {
-            //指定的虚拟页不存在
-            EMPTY_BLOCK_LOCATION
-        };
-
-        if location.is_empty() {
-            //忽略空块的释放
-            return true;
+            //虚拟页是保留页
+            unimplemented!()
         }
-
-        //异步释放指定块设备的指定块
-        let offset = page_id.device_offset();
-        let devices = self.0.devices.clone();
-        let _ = self.0.rt.spawn(async move {
-            if let Some(device) = devices.get(&offset) {
-                //指定位置的块设备存在，则释放指定的块
-                device.free_block(&location).await;
-            }
-        });
 
         //TODO...
 
@@ -513,13 +577,14 @@ impl<
     BV: Debug + Clone + Hash + Eq + Send + Sync + 'static,
     BD: DeviceDetail<Key = BK, Val = BV>,
 > VirtualPageManager<C, O, B, D, P, I, M, BU, BS, BK, BV, BD> {
-    /// 异步阻塞的分配指定大小的页，在指定块设备上立即为页分配块空间，
+    /// 异步阻塞的分配指定大小的页，并立即在指定块设备上为页分配块空间，
+    /// 不允许立即分配内部页，立即分配内部页将返回空页id
     /// 提交分配成功后再返回非空页id，分配0大小的页则返回空页id，
     /// 分配虚拟页唯一id失败则立即抛出异常，提交分配失败也会立即抛出异常
     pub async fn immediate_alloc_page(&self,
                                       offset: u32,
                                       size: usize) -> PageId {
-        if size == 0 {
+        if offset == 0 || size == 0 {
             //分配大小为0的页，则立即返回空页
             return PageId::empty();
         }
@@ -543,55 +608,58 @@ impl<
         let mut iterator = self.0.table.iter();
 
         let mut page_ids = Vec::with_capacity(self.0.table.len());
-        while let Some((id, _location)) = iterator.next() {
-            let page_id = PageId::new(id);
+        while let Some(item) = iterator.next() {
+            let page_id = PageId::new(item.page_id());
             if !page_id.is_empty() {
                 //指定的虚拟页不是空页
-                let offset = page_id.device_offset();
-                if !self.0.pool.contains(page_id.as_ref()) {
-                    //指定的虚拟页的页缓冲不存在，则立即创建对应的页缓冲
-                    let base_page = P::with_page_type(page_id.clone(),
-                                                      page_id.clone(),
-                                                      None); //创建一个虚拟页的基页
-                    let buffer = PageBuffer::new(base_page, self.0.pool.get_limit());
-                    self.0.pool.join_page(*page_id.as_ref(), buffer); //在虚拟页缓冲池中加入页缓冲
-                }
+                if page_id.is_normal() {
+                    //加载的是普通页
+                    let offset = page_id.device_offset();
+                    if !self.0.pool.contains(page_id.as_ref()) {
+                        //指定的虚拟页的页缓冲不存在，则立即创建对应的页缓冲
+                        let base_page = P::with_page_type(page_id.clone(),
+                                                          page_id.clone(),
+                                                          None); //创建一个虚拟页的基页
+                        let buffer = PageBuffer::new(base_page, self.0.pool.get_limit());
+                        self.0.pool.join_page(*page_id.as_ref(), buffer); //在虚拟页缓冲池中加入页缓冲
+                    }
 
-                if let Some(buffer) = self.0.pool.get_page_buffer(page_id.as_ref()) {
-                    if buffer
-                        .base_page()
-                        .lock()
-                        .is_missing_pages() {
-                        //页缓冲缺页，则立即加载基页数据
-                        if let Some(location) = self.0.table.addressing(page_id.as_ref()) {
-                            match read_block(&self.0.rt,
-                                             &self.0.devices,
-                                             offset,
-                                             &BlockLocation::new(location),
-                                             is_checksum).await {
-                                Err(e) => {
-                                    //读块数据失败，则立即返回错误原因
-                                    return Err(Error::new(ErrorKind::Other,
-                                                          format!("Load page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
-                                                                  page_id,
-                                                                  is_checksum,
-                                                                  e)));
-                                },
-                                Ok(bin) => {
-                                    //读块数据成功
-                                    let mut locked = buffer
-                                        .base_page()
-                                        .lock();
+                    if let Some(buffer) = self.0.pool.get_page_buffer(page_id.as_ref()) {
+                        if buffer
+                            .base_page()
+                            .lock()
+                            .is_missing_pages() {
+                            //页缓冲缺页，则立即加载基页数据
+                            if let Some(location) = self.0.table.addressing(&page_id) {
+                                match read_block(&self.0.rt,
+                                                 &self.0.devices,
+                                                 offset,
+                                                 &BlockLocation::new(location),
+                                                 is_checksum).await {
+                                    Err(e) => {
+                                        //读块数据失败，则立即返回错误原因
+                                        return Err(Error::new(ErrorKind::Other,
+                                                              format!("Load page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
+                                                                      page_id,
+                                                                      is_checksum,
+                                                                      e)));
+                                    },
+                                    Ok(bin) => {
+                                        //读块数据成功
+                                        let mut locked = buffer
+                                            .base_page()
+                                            .lock();
 
-                                    locked.deserialize_page(bin); //将块数据反序列化为基页数据
-                                },
+                                        locked.deserialize_page(bin); //将块数据反序列化为基页数据
+                                    },
+                                }
+                            } else {
+                                //提交分配后，指定页面id必须有对应的块位置
+                                panic!("Load page failed, page_id: {:?}, device: {}, is_checksum: {:?}, reason: block location missing",
+                                       page_id,
+                                       offset,
+                                       is_checksum);
                             }
-                        } else {
-                            //提交分配后，指定页面id必须有对应的块位置
-                            panic!("Load page failed, page_id: {:?}, device: {}, is_checksum: {:?}, reason: block location missing",
-                                   page_id,
-                                   offset,
-                                   is_checksum);
                         }
                     }
                 }
@@ -603,9 +671,9 @@ impl<
         Ok(page_ids)
     }
 
-    /// 异步的读指定虚拟页
-    /// 读指定虚拟页时如果虚拟页对应的页缓冲不存在，则立即加载对应的基页数据
-    /// 如果当前虚拟页的页缓冲存在且为脏页，则需要立即对将写增量写入虚拟页的页缓冲的基页，保证读到最新的虚拟页数据
+    /// 异步的读指定普通虚拟页
+    /// 读指定普通虚拟页时如果虚拟页对应的页缓冲不存在，则立即加载对应的基页数据
+    /// 如果当前普通虚拟页的页缓冲存在且为脏页，则需要立即对将写增量写入虚拟页的页缓冲的基页，保证读到最新的虚拟页数据
     pub async fn read(&self,
                       page_type: Option<usize>,
                       page_id: &PageId,
@@ -659,7 +727,7 @@ impl<
             .lock()
             .is_missing_pages() {
             //页缓冲缺页，则立即加载基页数据
-            if let Some(location) = self.0.table.addressing(page_id.as_ref()) {
+            if let Some(location) = self.0.table.addressing(&page_id) {
                 //基页数据存在
                 match read_block(&self.0.rt,
                                  &self.0.devices,
@@ -1153,7 +1221,12 @@ fn create_page_id(uid: u32,
 fn register_page(table: &VirtualPageTable,
                  page_id: PageId,
                  location: BlockLocation) -> Option<BlockLocation> {
-    if let Some(old) = table.register(*page_id, *location) {
+    if !page_id.is_normal() {
+        //忽略保留页和内部页的注册
+        return None;
+    }
+
+    if let Some(old) = table.register(page_id, *location) {
         //指定页id的虚拟页已存在，则返回已存在的虚拟页的块位置
         Some(BlockLocation::new(old))
     } else {
@@ -1165,10 +1238,16 @@ fn register_page(table: &VirtualPageTable,
 // 在保留的虚拟页表中注册指定虚拟页
 // 保留的虚拟页并没有分配对应的块，会在提供分配后再分配对应的块
 // 成功返回空，失败则返回已存在的保留的虚拟页的大小
+// 注意保留的虚拟页表，不是保留页，保留页是虚拟页唯一ID中虚拟页面唯一ID和块设备编号都为0的页面
 #[inline]
 fn register_reserved_page(reserved: &DashMap<u128, usize>,
                           page_id: PageId,
                           size: usize) -> Option<usize> {
+    if !page_id.is_normal() {
+        //忽略保留页和内部页的注册
+        return None;
+    }
+
     if let Some(old) = reserved.insert(*page_id, size) {
         //指定页id的保留的虚拟页已存在，则返回已存在的保留的虚拟页的大小
         Some(old)
@@ -1194,6 +1273,11 @@ async fn commit_alloced<BU, BS, BK, BV, BD, BF>(table: &VirtualPageTable,
           BV: Debug + Clone + Hash + Eq + Send + Sync + 'static,
           BD: DeviceDetail<Key = BK, Val = BV>,
           BF: AsRef<[u8]> + Clone + Send + Sync + 'static {
+    if !page_id.is_normal() {
+        //忽略保留页和内部页的提交，并返回空块
+        return EMPTY_BLOCK;
+    }
+
     let offset = page_id.device_offset(); //获取虚拟页所在的块设备，在虚拟页管理器中的位置
     if let Some(device) = devices.get(&offset) {
         //指定虚拟页所在的块设备存在
@@ -1238,7 +1322,7 @@ async fn commit_alloced<BU, BS, BK, BV, BD, BF>(table: &VirtualPageTable,
                 }
 
                 //原子的更新指定页id对应的块位置
-                match table.update_location(page_id.as_ref(),
+                match table.update_location(&page_id,
                                             EMPTY_BLOCK,
                                             *location) {
                     Err(e) => {
@@ -1331,8 +1415,10 @@ async fn flush_write_to_pages<C, O, B, D, P, I, M>(table: &VirtualPageTable,
           M: VirtualPageCachingStrategy<C, O, B, D, P, Iter = I> {
     while let Some(delta) = cmd.pop_front() {
         let copied_page_id = delta.get_copied_page_id();
-        if copied_page_id.is_empty() || !table.contains_page(&copied_page_id) {
-            //忽略空页或不存在的页的刷新，并继续刷新下一个页缓冲
+        if copied_page_id.is_empty()
+            || (copied_page_id.is_normal()
+            && !table.contains_page(&copied_page_id)) {
+            //忽略空页或不存在的普通页的刷新，并继续刷新下一个页缓冲
             continue;
         }
         let page_type = delta.get_type();
@@ -1429,8 +1515,9 @@ async fn flush_followup_write_to_pages<C, O, B, D, P, I, M>(table: &VirtualPageT
 
     while let Some(delta) = cmd.pop_front_from_followup() {
         let copied_page_id = delta.get_copied_page_id();
-        if copied_page_id.is_empty() || !table.contains_page(&copied_page_id) {
-            //忽略空页或不存在的页的刷新，并继续刷新下一个页缓冲
+        if copied_page_id.is_empty() || (copied_page_id.is_normal()
+            && !table.contains_page(&copied_page_id)) {
+            //忽略空页或不存在的普通页的刷新，并继续刷新下一个页缓冲
             continue;
         }
         let page_type = delta.get_type();
@@ -1564,90 +1651,95 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
         let mut copyed_base_page = buffer.copy_base_page();
         let origin_page_id = copyed_base_page.get_original_page_id();
         let copied_page_id = copyed_base_page.get_copied_page_id();
-        if copied_page_id.is_empty() || !table.contains_page(&copied_page_id) {
-            //忽略空页或不存在的页的同步
+        if copied_page_id.is_empty()
+            || (copied_page_id.is_normal()
+            && !table.contains_page(&copied_page_id)) {
+            //忽略空页或不存在的普通页的同步
             return Ok(0);
         }
         let offset = copied_page_id.device_offset();
 
         let mut old_location = EMPTY_BLOCK; //默认旧的块位置为空块
         let mut new_location = EMPTY_BLOCK_LOCATION; //默认新的块位置为空块
-        if reserved.contains_key(copied_page_id.as_ref()) {
-            //复制的脏页的基页是保留的虚拟页，则为保留的虚拟页提交分配
-            //不需要为刚提交分配的虚拟页换入缺页的虚拟页，因为刚提交的保留的虚拟页一定会出现基页缺页，需要写增量对其进行初始化
-            new_location = BlockLocation::new(commit_alloced(table,
-                                                             reserved,
-                                                             devices,
-                                                             copied_page_id.clone(),
-                                                             None).await);
-            old_location = *new_location; //为已提交分配的保留的虚拟页，设置旧的块位置
-        } else {
-            //复制的脏页的基页是已提交的虚拟页
-            if copyed_base_page.is_missing_pages() {
-                //复制的脏页的基页缺页，则需要先换入缺页的虚拟页
-                if let Some(location) = table.addressing(origin_page_id.as_ref()) {
-                    //如果当前缺页的复制的脏页的基页对应的不是空块，则加载对应的原始虚拟页所指定的块位置的块数据，并将块数据反序列化为复制的脏页的基页
-                    match read_block(rt,
-                                     devices,
-                                     offset,
-                                     &BlockLocation::new(location),
-                                     is_checksum).await {
-                        Err(e) => {
-                            //读块数据失败，则立即通知对应的写指令，并立即返回错误原因
-                            let mut deltas = buffer.get_deltas().lock();
-                            while let Some(delta) = deltas.pop_front() {
-                                let delta_cmd_index = delta.get_cmd_index();
-                                let delta_type = delta.get_type();
+        if copied_page_id.is_normal() {
+            //复制的基页是普通页
+            if reserved.contains_key(copied_page_id.as_ref()) {
+                //复制的脏页的基页是保留的虚拟页，则为保留的虚拟页提交分配
+                //不需要为刚提交分配的虚拟页换入缺页的虚拟页，因为刚提交的保留的虚拟页一定会出现基页缺页，需要写增量对其进行初始化
+                new_location = BlockLocation::new(commit_alloced(table,
+                                                                 reserved,
+                                                                 devices,
+                                                                 copied_page_id.clone(),
+                                                                 None).await);
+                old_location = *new_location; //为已提交分配的保留的虚拟页，设置旧的块位置
+            } else {
+                //复制的脏页的基页是已提交的虚拟页
+                if copyed_base_page.is_missing_pages() {
+                    //复制的脏页的基页缺页，则需要先换入缺页的虚拟页
+                    if let Some(location) = table.addressing(&origin_page_id) {
+                        //如果当前缺页的复制的脏页的基页对应的不是空块，则加载对应的原始虚拟页所指定的块位置的块数据，并将块数据反序列化为复制的脏页的基页
+                        match read_block(rt,
+                                         devices,
+                                         offset,
+                                         &BlockLocation::new(location),
+                                         is_checksum).await {
+                            Err(e) => {
+                                //读块数据失败，则立即通知对应的写指令，并立即返回错误原因
+                                let mut deltas = buffer.get_deltas().lock();
+                                while let Some(delta) = deltas.pop_front() {
+                                    let delta_cmd_index = delta.get_cmd_index();
+                                    let delta_type = delta.get_type();
 
-                                if let Some(write_cmd) = write_cmd_buffer
-                                    .lock()
-                                    .await
-                                    .get(&delta_cmd_index) {
-                                    let _ = write_cmd
-                                        .callback_by_sync(Err(Error::new(ErrorKind::Other,
-                                                                         format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, type: {}, is_checksum: {:?}, reason: {:?}",
-                                                                                 copied_page_id,
-                                                                                 offset,
-                                                                                 delta_cmd_index,
-                                                                                 delta_type,
-                                                                                 is_checksum,
-                                                                                 e))))
-                                        .await;
+                                    if let Some(write_cmd) = write_cmd_buffer
+                                        .lock()
+                                        .await
+                                        .get(&delta_cmd_index) {
+                                        let _ = write_cmd
+                                            .callback_by_sync(Err(Error::new(ErrorKind::Other,
+                                                                             format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, type: {}, is_checksum: {:?}, reason: {:?}",
+                                                                                     copied_page_id,
+                                                                                     offset,
+                                                                                     delta_cmd_index,
+                                                                                     delta_type,
+                                                                                     is_checksum,
+                                                                                     e))))
+                                            .await;
+                                    }
                                 }
-                            }
 
-                            return Err(Error::new(ErrorKind::Other,
-                                                  format!("Sync dirty page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
-                                                          copied_page_id,
-                                                          is_checksum,
-                                                          e)));
-                        },
-                        Ok(bin) => {
-                            //读块数据成功
-                            copyed_base_page.deserialize_page(bin); //将块数据反序列化为复制的脏页的基页
-                            old_location = location; //设置旧的块位置
-                        },
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Sync dirty page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
+                                                              copied_page_id,
+                                                              is_checksum,
+                                                              e)));
+                            },
+                            Ok(bin) => {
+                                //读块数据成功
+                                copyed_base_page.deserialize_page(bin); //将块数据反序列化为复制的脏页的基页
+                                old_location = location; //设置旧的块位置
+                            },
+                        }
+                    } else {
+                        //提交分配后，指定页面id必须有对应的块位置
+                        panic!("Flush drity page failed, page_id: {:?}, device: {}, size: {}, is_checksum: {:?}, reason: block location missing",
+                               copied_page_id,
+                               offset,
+                               buffer_size,
+                               is_checksum);
                     }
                 } else {
-                    //提交分配后，指定页面id必须有对应的块位置
-                    panic!("Flush drity page failed, page_id: {:?}, device: {}, size: {}, is_checksum: {:?}, reason: block location missing",
-                           copied_page_id,
-                           offset,
-                           buffer_size,
-                           is_checksum);
-                }
-            } else {
-                //复制的脏页的基页不缺页，则不需要先换入缺页的虚拟页
-                if let Some(location) = table.addressing(origin_page_id.as_ref()) {
-                    //设置旧的块位置
-                    old_location = location;
-                } else {
-                    //提交分配后，指定页面id必须有对应的块位置
-                    panic!("Flush drity page failed, page_id: {:?}, device: {}, size: {}, is_checksum: {:?}, reason: block location missing",
-                           copied_page_id,
-                           offset,
-                           buffer_size,
-                           is_checksum);
+                    //复制的脏页的基页不缺页，则不需要先换入缺页的虚拟页
+                    if let Some(location) = table.addressing(&origin_page_id) {
+                        //设置旧的块位置
+                        old_location = location;
+                    } else {
+                        //提交分配后，指定页面id必须有对应的块位置
+                        panic!("Flush drity page failed, page_id: {:?}, device: {}, size: {}, is_checksum: {:?}, reason: block location missing",
+                               copied_page_id,
+                               offset,
+                               buffer_size,
+                               is_checksum);
+                    }
                 }
             }
         }
@@ -1698,14 +1790,80 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
             }
         }
 
-        let copyed_base_page_clone = copyed_base_page.clone();
-        let copyed_base_page_bin = copyed_base_page.serialize_page();
-        let copyed_base_page_buf_len = calc_page_len(&copyed_base_page_bin);
-        if new_location.is_empty() {
-            //当前虚拟页是已存储到块设备上的块数据的映射，则需要根据复制的脏页的基页的合并后大小，分配指定块设备的新块
-            match alloc_block(devices, offset, copyed_base_page_buf_len).await {
+        if copied_page_id.is_normal() {
+            //复制的基页是普通页
+            let copyed_base_page_clone = copyed_base_page.clone();
+            let copyed_base_page_bin = copyed_base_page.serialize_page();
+            let copyed_base_page_buf_len = calc_page_len(&copyed_base_page_bin);
+            if new_location.is_empty() {
+                //当前虚拟页是已存储到块设备上的块数据的映射，则需要根据复制的脏页的基页的合并后大小，分配指定块设备的新块
+                match alloc_block(devices, offset, copyed_base_page_buf_len).await {
+                    Err(e) => {
+                        //分配块失败，则立即通知对应的写指令，并立即返回错误原因
+                        for (delta_cmd_index, _sync_count) in cmd_indexs {
+                            if let Some(write_cmd) = write_cmd_buffer
+                                .lock()
+                                .await
+                                .get(&delta_cmd_index) {
+                                //对应写指令编号的写指令存在
+                                let _ = write_cmd
+                                    .callback_by_sync(Err(Error::new(ErrorKind::Other,
+                                                                     format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, is_checksum: {:?}, reason: {:?}",
+                                                                             copied_page_id,
+                                                                             offset,
+                                                                             delta_cmd_index,
+                                                                             is_checksum,
+                                                                             e))))
+                                    .await;
+                            }
+                        }
+
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Sync dirty page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
+                                                      copied_page_id,
+                                                      is_checksum,
+                                                      e)));
+                    },
+                    Ok(location) => {
+                        //分配块成功
+                        new_location = location;
+                    },
+                }
+            }
+
+            let copyed_base_page_buf = if let Some(entry) = devices.get(&offset) {
+                //指定的块设备存在，则写页头
+                let device = entry.value();
+                let block_size = device.block_size(&new_location);
+                write_page_header(copied_page_id.clone().into(),
+                                  block_size as u32,
+                                  copyed_base_page_bin)
+            } else {
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Sync dirty page failed, offset: {:?}, page_id: {:?}, is_checksum: {:?}, reason: devices missing",
+                                              offset,
+                                              copied_page_id,
+                                              is_checksum)));
+            };
+            if copyed_base_page_buf.as_ref().len() != copyed_base_page_buf_len {
+                //计算的页数据大小与实际页数据大小不匹配，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Sync dirty page failed, page_id: {:?}, size: {:?}, real: {:?}, is_checksum: {:?}, reason: mismatch page size",
+                                              copied_page_id,
+                                              copyed_base_page_buf_len,
+                                              copyed_base_page_buf.as_ref().len(),
+                                              is_checksum)));
+            }
+
+            //将合并后的复制的脏页的基页写入分配的块中
+            match write_block(rt,
+                              devices,
+                              offset,
+                              &new_location,
+                              copyed_base_page_buf,
+                              WriteOption::Sync).await {
                 Err(e) => {
-                    //分配块失败，则立即通知对应的写指令，并立即返回错误原因
+                    //写块数据失败，则立即通知对应的写指令，并立即返回错误原因
                     for (delta_cmd_index, _sync_count) in cmd_indexs {
                         if let Some(write_cmd) = write_cmd_buffer
                             .lock()
@@ -1730,46 +1888,109 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                                                   is_checksum,
                                                   e)));
                 },
-                Ok(location) => {
-                    //分配块成功
-                    new_location = location;
+                Ok(_) => {
+                    //在新的块位置上写块数据成功，则立即更新虚拟页表中指定虚拟页对应的块位置
+                    if let Err(current_location) = table.update_location(&copied_page_id, old_location, *new_location) {
+                        //更新虚拟页表中指定虚拟页对应的块位置失败，则立即通知对应的写指令，并立即返回错误原因
+                        for (delta_cmd_index, _sync_count) in cmd_indexs {
+                            if let Some(write_cmd) = write_cmd_buffer
+                                .lock()
+                                .await
+                                .get(&delta_cmd_index) {
+                                //对应写指令编号的写指令存在
+                                let _ = write_cmd
+                                    .callback_by_sync(Err(Error::new(ErrorKind::Other,
+                                                                     format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, current_location: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: update location failed",
+                                                                             copied_page_id,
+                                                                             offset,
+                                                                             delta_cmd_index,
+                                                                             current_location,
+                                                                             old_location,
+                                                                             *new_location,
+                                                                             is_checksum))))
+                                    .await;
+                            }
+                        }
+
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Sync dirty page failed, page_id: {:?}, current_location: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: update location failed",
+                                                      copied_page_id,
+                                                      current_location,
+                                                      old_location,
+                                                      *new_location,
+                                                      is_checksum)));
+                    }
+
+                    //强制刷新虚拟页表，以持久化更新虚拟页表的结果
+                    if let Err(e) = table.flush().await {
+                        //强制刷新虚拟页表失败，则立即通知对应的写指令，并立即返回错误原因
+                        for (delta_cmd_index, _sync_count) in cmd_indexs {
+                            if let Some(write_cmd) = write_cmd_buffer
+                                .lock()
+                                .await
+                                .get(&delta_cmd_index) {
+                                //对应写指令编号的写指令存在
+                                let _ = write_cmd
+                                    .callback_by_sync(Err(Error::new(ErrorKind::Other,
+                                                                     format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: {:?}",
+                                                                             copied_page_id,
+                                                                             offset,
+                                                                             delta_cmd_index,
+                                                                             old_location,
+                                                                             *new_location,
+                                                                             is_checksum,
+                                                                             e))))
+                                    .await;
+                            }
+                        }
+
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Sync dirty page failed, page_id: {:?}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: {:?}",
+                                                      copied_page_id,
+                                                      old_location,
+                                                      *new_location,
+                                                      is_checksum,
+                                                      e)));
+                    }
+
+                    //将合并后的复制得基页替换当前脏页的基页
+                    buffer.set_base_page(copyed_base_page_clone);
+
+                    //更新虚拟页表中指定虚拟页对应的块位置成功，则表示写虚拟页成功，则立即通知对应的写指令
+                    for (delta_cmd_index, sync_count) in cmd_indexs {
+                        let mut is_remove_cmd = false; //初始化是否移除写指令的标记
+
+                        if let Some(write_cmd) = write_cmd_buffer
+                            .lock()
+                            .await
+                            .get(&delta_cmd_index) {
+                            //对应写指令编号的写指令存在，调用当前写指令的写增量的成功回调
+                            let _ = write_cmd.callback_by_sync(Ok(sync_count)).await;
+
+                            if write_cmd.deltas_len() == 0 && write_cmd.followup_len() == 0 {
+                                is_remove_cmd = true;
+                            }
+                        }
+
+                        if is_remove_cmd {
+                            //写指令的所有写增量和所有后续写增量已同步成功，则将写指令从写缓冲中移除
+                            let _ = write_cmd_buffer
+                                .lock()
+                                .await
+                                .remove(&delta_cmd_index);
+                        }
+                    }
                 },
             }
-        }
+        } else if copied_page_id.is_internal() {
+            //复制的页是内部页
+            let copyed_base_page_bin = copyed_base_page.serialize_page();
+            table.write_internal_page(origin_page_id,
+                                      copyed_base_page_bin.as_ref());
 
-        let copyed_base_page_buf = if let Some(entry) = devices.get(&offset) {
-            //指定的块设备存在，则写页头
-            let device = entry.value();
-            let block_size = device.block_size(&new_location);
-            write_page_header(copied_page_id.clone().into(),
-                              block_size as u32,
-                              copyed_base_page_bin)
-        } else {
-            return Err(Error::new(ErrorKind::Other,
-                                  format!("Sync dirty page failed, offset: {:?}, page_id: {:?}, is_checksum: {:?}, reason: devices missing",
-                                          offset,
-                                          copied_page_id,
-                                          is_checksum)));
-        };
-        if copyed_base_page_buf.as_ref().len() != copyed_base_page_buf_len {
-            //计算的页数据大小与实际页数据大小不匹配，则立即返回错误原因
-            return Err(Error::new(ErrorKind::Other,
-                                  format!("Sync dirty page failed, page_id: {:?}, size: {:?}, real: {:?}, is_checksum: {:?}, reason: mismatch page size",
-                                          copied_page_id,
-                                          copyed_base_page_buf_len,
-                                          copyed_base_page_buf.as_ref().len(),
-                                          is_checksum)));
-        }
-
-        //将合并后的复制的脏页的基页写入分配的块中
-        match write_block(rt,
-                          devices,
-                          offset,
-                          &new_location,
-                          copyed_base_page_buf,
-                          WriteOption::Sync).await {
-            Err(e) => {
-                //写块数据失败，则立即通知对应的写指令，并立即返回错误原因
+            //强制刷新虚拟页表，以持久化更新内部页在虚拟页表的内容
+            if let Err(e) = table.flush().await {
+                //强制刷新虚拟页表失败，则立即通知对应的写指令，并立即返回错误原因
                 for (delta_cmd_index, _sync_count) in cmd_indexs {
                     if let Some(write_cmd) = write_cmd_buffer
                         .lock()
@@ -1778,115 +1999,45 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                         //对应写指令编号的写指令存在
                         let _ = write_cmd
                             .callback_by_sync(Err(Error::new(ErrorKind::Other,
-                                                             format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, is_checksum: {:?}, reason: {:?}",
+                                                             format!("Sync dirty internal page failed, page_id: {:?}, device: {}, cmd_index: {}, reason: {:?}",
                                                                      copied_page_id,
                                                                      offset,
                                                                      delta_cmd_index,
-                                                                     is_checksum,
                                                                      e))))
                             .await;
                     }
                 }
 
                 return Err(Error::new(ErrorKind::Other,
-                                      format!("Sync dirty page failed, page_id: {:?}, is_checksum: {:?}, reason: {:?}",
+                                      format!("Sync dirty internal page failed, page_id: {:?}, reason: {:?}",
                                               copied_page_id,
-                                              is_checksum,
                                               e)));
-            },
-            Ok(_) => {
-                //在新的块位置上写块数据成功，则立即更新虚拟页表中指定虚拟页对应的块位置
-                if let Err(current_location) = table.update_location(copied_page_id.as_ref(), old_location, *new_location) {
-                    //更新虚拟页表中指定虚拟页对应的块位置失败，则立即通知对应的写指令，并立即返回错误原因
-                    for (delta_cmd_index, _sync_count) in cmd_indexs {
-                        if let Some(write_cmd) = write_cmd_buffer
-                            .lock()
-                            .await
-                            .get(&delta_cmd_index) {
-                            //对应写指令编号的写指令存在
-                            let _ = write_cmd
-                                .callback_by_sync(Err(Error::new(ErrorKind::Other,
-                                                                 format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, current_location: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: update location failed",
-                                                                         copied_page_id,
-                                                                         offset,
-                                                                         delta_cmd_index,
-                                                                         current_location,
-                                                                         old_location,
-                                                                         *new_location,
-                                                                         is_checksum))))
-                                .await;
-                        }
-                    }
+            }
 
-                    return Err(Error::new(ErrorKind::Other,
-                                          format!("Sync dirty page failed, page_id: {:?}, current_location: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: update location failed",
-                                                  copied_page_id,
-                                                  current_location,
-                                                  old_location,
-                                                  *new_location,
-                                                  is_checksum)));
+            //持久化内部页并更新虚拟页表的超级页成功，则表示写内部页成功，则立即通知对应的写指令
+            for (delta_cmd_index, sync_count) in cmd_indexs {
+                let mut is_remove_cmd = false; //初始化是否移除写指令的标记
+
+                if let Some(write_cmd) = write_cmd_buffer
+                    .lock()
+                    .await
+                    .get(&delta_cmd_index) {
+                    //对应写指令编号的写指令存在，调用当前写指令的写增量的成功回调
+                    let _ = write_cmd.callback_by_sync(Ok(sync_count)).await;
+
+                    if write_cmd.deltas_len() == 0 && write_cmd.followup_len() == 0 {
+                        is_remove_cmd = true;
+                    }
                 }
 
-                //强制刷新虚拟页表，以持久化更新虚拟页表的结果
-                if let Err(e) = table.flush().await {
-                    //强制刷新虚拟页表失败，则立即通知对应的写指令，并立即返回错误原因
-                    for (delta_cmd_index, _sync_count) in cmd_indexs {
-                        if let Some(write_cmd) = write_cmd_buffer
-                            .lock()
-                            .await
-                            .get(&delta_cmd_index) {
-                            //对应写指令编号的写指令存在
-                            let _ = write_cmd
-                                .callback_by_sync(Err(Error::new(ErrorKind::Other,
-                                                                 format!("Sync dirty page failed, page_id: {:?}, device: {}, cmd_index: {}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: {:?}",
-                                                                         copied_page_id,
-                                                                         offset,
-                                                                         delta_cmd_index,
-                                                                         old_location,
-                                                                         *new_location,
-                                                                         is_checksum,
-                                                                         e))))
-                                .await;
-                        }
-                    }
-
-                    return Err(Error::new(ErrorKind::Other,
-                                          format!("Sync dirty page failed, page_id: {:?}, old_location: {}, new_location: {}, is_checksum: {:?}, reason: {:?}",
-                                                  copied_page_id,
-                                                  old_location,
-                                                  *new_location,
-                                                  is_checksum,
-                                                  e)));
-                }
-
-                //将合并后的复制得基页替换当前脏页的基页
-                buffer.set_base_page(copyed_base_page_clone);
-
-                //更新虚拟页表中指定虚拟页对应的块位置成功，则表示写虚拟页成功，则立即通知对应的写指令
-                for (delta_cmd_index, sync_count) in cmd_indexs {
-                    let mut is_remove_cmd = false; //初始化是否移除写指令的标记
-
-                    if let Some(write_cmd) = write_cmd_buffer
+                if is_remove_cmd {
+                    //写指令的所有写增量和所有后续写增量已同步成功，则将写指令从写缓冲中移除
+                    let _ = write_cmd_buffer
                         .lock()
                         .await
-                        .get(&delta_cmd_index) {
-                        //对应写指令编号的写指令存在，调用当前写指令的写增量的成功回调
-                        let _ = write_cmd.callback_by_sync(Ok(sync_count)).await;
-
-                        if write_cmd.deltas_len() == 0 && write_cmd.followup_len() == 0 {
-                            is_remove_cmd = true;
-                        }
-                    }
-
-                    if is_remove_cmd {
-                        //写指令的所有写增量和所有后续写增量已同步成功，则将写指令从写缓冲中移除
-                        let _ = write_cmd_buffer
-                            .lock()
-                            .await
-                            .remove(&delta_cmd_index);
-                    }
+                        .remove(&delta_cmd_index);
                 }
-            },
+            }
         }
     }
 
