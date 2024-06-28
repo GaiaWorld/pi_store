@@ -996,6 +996,136 @@ fn test_virtual_page_manager_load_copy_on_write() {
     thread::sleep(Duration::from_millis(1000000000));
 }
 
+// 加载已有页面，并写时复制的方式更新已有页面，然后加载已存在的内部页面
+// 初始化时使用空页面进行写时复制的更新
+#[test]
+fn test_virtual_page_manager_load_copy_on_write_and_load_internal_page() {
+    //启动日志系统
+    env_logger::builder().format_timestamp_millis().init();
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
+
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
+        let page_manager = VirtualPageManagerBuilder::new(1,
+                                                          rt_copy.clone(),
+                                                          "./page_table",
+                                                          cache)
+            .set_init_page_uid(1)
+            .set_table_log_file_limit(32 * 1024 * 1024)
+            .set_table_load_buf_len(8192)
+            .set_pool_buffer_delta_limit(8192)
+            .set_table_delay_timeout(1)
+            .build()
+            .await;
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
+        register_release_handler(1,
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
+
+        //加载虚拟页表中的所有虚拟页
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(mut page_ids) => {
+                let mut current_page_id = PageId::empty();
+
+                page_ids.sort();
+                for page_id in page_ids {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                                count += 1;
+                                current_page_id = page_id;
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                            count += 1;
+                        } else {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        }
+                    } else {
+                        unimplemented!()
+                    }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                //初始化写指令
+                let mut cmd = VirtualPageWriteCmd::new();
+
+                //为写指令增加1个增量
+                let new_page_id = page_manager
+                    .alloc_page(1, 16) ;
+                cmd.append(TestWriteDelta::new(current_page_id.clone(),
+                                               new_page_id.clone()));
+
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
+                let new_follow_up_page_id = page_manager
+                    .alloc_page(0, 32);
+                cmd.follow_up(TestWriteDelta::new(new_follow_up_page_id.clone(),
+                                                  new_follow_up_page_id.clone()));
+
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+
+                        let mut iterator = page_manager.iter_internal_pages();
+                        for internal_page_id in iterator {
+                            if let Some(output) = page_manager.read_internal(&internal_page_id) {
+                                println!("!!!!!!read internal ok, page_id: {:?}, data: {:?}",
+                                         internal_page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                                count += 1;
+                            } else {
+                                println!("!!!!!!read internal ok, page_id: {:?}, data: None", internal_page_id);
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
 // 加载已有页面，并写时复制的方式更新已有页面，并释放更新后的原始页面
 // 初始化时使用空页面进行写时复制的更新
 #[test]

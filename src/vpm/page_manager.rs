@@ -18,10 +18,7 @@ use pi_async_rt::rt::{AsyncRuntime,
                       multi_thread::MultiTaskRuntime};
 use pi_guid::Guid;
 
-use crate::vpm::{EMPTY_PAGE, VIRTUAL_PAGE_MANAGER_DEVICES_INDEX, VirtualPageWriteDelta, VirtualPageBuf, PageId, VirtualPageWriteCmd, WriteIndex,
-                 page_cache::{VirtualPageLFUCache, VirtualPageLFUCacheDirtyIterator},
-                 page_table::{VirtualPageTable, VirtualPageTableIteratorItem},
-                 page_pool::{VirtualPageCachingStrategy, VirtualPageBufferPool, PageBuffer}};
+use crate::vpm::{EMPTY_PAGE, VIRTUAL_PAGE_MANAGER_DEVICES_INDEX, VirtualPageWriteDelta, VirtualPageBuf, PageId, VirtualPageWriteCmd, WriteIndex, VirtualPageEncoding, DefaultVirtualPageEncoder, page_cache::{VirtualPageLFUCache, VirtualPageLFUCacheDirtyIterator}, page_table::{VirtualPageTable, VirtualPageTableIteratorItem}, page_pool::{VirtualPageCachingStrategy, VirtualPageBufferPool, PageBuffer}, VirtualPageEncodingType};
 use crate::devices::{EMPTY_BLOCK, EMPTY_BLOCK_LOCATION, DeviceDetail, DeviceValueType, DeviceDetailMap, DeviceStatus, BlockDevice, BlockLocation, WriteOption};
 
 ///
@@ -71,7 +68,7 @@ const DEFAULT_TABLE_DELAY_TIMEOUT: usize = 1;
 ///
 /// 页头大小，单位B
 ///
-const PAGE_HEADER_SIZE: usize = 36;
+const PAGE_HEADER_SIZE: usize = 38;
 
 ///
 /// 默认的页写增量缓冲大小限制，单位B
@@ -121,6 +118,7 @@ pub struct VirtualPageManagerBuilder<
     cache:                  M,                                                              //页缓冲的缓存
     limit:                  usize,                                                          //页缓冲的写增量缓冲大小限制，单位B
     sync_interval:          usize,                                                          //页缓冲的定时同步时间间隔，单位ms
+    encoder:                Arc<dyn VirtualPageEncoding<Raw = B, Encoded = B>>,             //虚拟页编码器
     marker:                 PhantomData<(C, O, B, D, P, I, M, BU, BS, BK, BV, BD)>,
 }
 
@@ -164,6 +162,7 @@ impl<
             cache,
             limit: DEFAULT_TABLE_LOG_FILE_LIMIT,
             sync_interval: DEFAULT_FLUSH_INTERVAL,
+            encoder: Arc::new(DefaultVirtualPageEncoder::default()),
             marker: PhantomData,
         }
     }
@@ -203,6 +202,12 @@ impl<
         self.sync_interval = sync_interval;
         self
     }
+
+    /// 设置虚拟页编码器
+    pub fn set_encoder(mut self, encoder: impl VirtualPageEncoding<Raw = B, Encoded = B>) -> Self {
+        self.encoder = Arc::new(encoder);
+        self
+    }
 }
 
 /*
@@ -240,6 +245,7 @@ impl<
                                               self.limit);
         let reserved = Arc::new(DashMap::new());
         let devices = Arc::new(DashMap::new());
+        let encoder = self.encoder;
         let sync_interval = self.sync_interval;
         let write_cmd_index = AtomicU64::new(1);
         let write_cmd_buffer = Arc::new(Mutex::new(BTreeMap::new()));
@@ -251,6 +257,7 @@ impl<
             pool,
             reserved,
             devices,
+            encoder,
             sync_interval,
             write_cmd_index,
             write_cmd_buffer,
@@ -467,6 +474,35 @@ impl<
         }
     }
 
+    /// 获取当前最近的内部页面唯一ID
+    pub fn last_internal_page(&self) -> PageId {
+        let last_internal_page_uid = self
+            .0
+            .table
+            .current_internal_page_uid()
+            .checked_sub(1)
+            .unwrap_or(0);
+
+        create_page_id(self.0.uid, 0, last_internal_page_uid)
+    }
+
+    /// 获取当前内部页面的迭代器
+    pub fn iter_internal_pages(&self) -> InternalPageIterator {
+        let vpm_uid = self.0.uid;
+        let last_internal_page_uid = self
+            .0
+            .table
+            .current_internal_page_uid()
+            .checked_sub(1)
+            .unwrap_or(0);
+
+        InternalPageIterator {
+            vpm_uid,
+            last_internal_page_uid,
+            is_finish: false,
+        }
+    }
+
     /// 同步非阻塞的读指定内部虚拟页
     pub fn read_internal(&self, page_id: &PageId) -> Option<Vec<u8>> {
         self
@@ -632,6 +668,7 @@ impl<
                             //页缓冲缺页，则立即加载基页数据
                             if let Some(location) = self.0.table.addressing(&page_id) {
                                 match read_block(&self.0.rt,
+                                                 &self.0.encoder,
                                                  &self.0.devices,
                                                  offset,
                                                  &BlockLocation::new(location),
@@ -730,6 +767,7 @@ impl<
             if let Some(location) = self.0.table.addressing(&page_id) {
                 //基页数据存在
                 match read_block(&self.0.rt,
+                                 &self.0.encoder,
                                  &self.0.devices,
                                  offset,
                                  &BlockLocation::new(location),
@@ -989,6 +1027,7 @@ impl<
         let rt = self.0.rt.clone();
         let table = self.0.table.clone();
         let reserved = self.0.reserved.clone();
+        let encoder = self.0.encoder.clone();
         let devices = self.0.devices.clone();
         let write_cmd_buffer = self.0.write_cmd_buffer.clone();
 
@@ -1002,6 +1041,7 @@ impl<
                 let buffer_size = match sync_dirty_page(&rt,
                                                         &table,
                                                         &reserved,
+                                                        &encoder,
                                                         &devices,
                                                         &write_cmd_buffer,
                                                         buffer.as_ref(),
@@ -1030,6 +1070,7 @@ impl<
         let table = self.0.table.clone();
         let pool = self.0.pool.clone();
         let reserved = self.0.reserved.clone();
+        let encoder = self.0.encoder.clone();
         let devices = self.0.devices.clone();
         let write_cmd_buffer = self.0.write_cmd_buffer.clone();
 
@@ -1038,6 +1079,7 @@ impl<
                              &table,
                              &pool,
                              &reserved,
+                             &encoder,
                              &devices,
                              &write_cmd_buffer,
                              is_checksum).await
@@ -1053,6 +1095,7 @@ impl<
         let table = self.0.table.clone();
         let pool = self.0.pool.clone();
         let reserved = self.0.reserved.clone();
+        let encoder = self.0.encoder.clone();
         let devices = self.0.devices.clone();
         let write_cmd_buffer = self.0.write_cmd_buffer.clone();
 
@@ -1072,6 +1115,7 @@ impl<
                                    &table,
                                    &pool,
                                    &reserved,
+                                   &encoder,
                                    &devices,
                                    &write_cmd_buffer,
                                    is_checksum).await {
@@ -1108,6 +1152,7 @@ impl<
                 match sync_dirty_page(&rt,
                                       &table,
                                       &reserved,
+                                      &encoder,
                                       &devices,
                                       &write_cmd_buffer,
                                       buffer.as_ref(),
@@ -1139,6 +1184,7 @@ impl<
         let rt = self.0.rt.clone();
         let table = self.0.table.clone();
         let reserved = self.0.reserved.clone();
+        let encoder = self.0.encoder.clone();
         let devices = self.0.devices.clone();
         let write_cmd_buffer = self.0.write_cmd_buffer.clone();
         let page_id = buffer.base_page().lock().get_original_page_id();
@@ -1149,6 +1195,7 @@ impl<
         let buffer_size = match sync_dirty_page(&rt,
                                                 &table,
                                                 &reserved,
+                                                &encoder,
                                                 &devices,
                                                 &write_cmd_buffer,
                                                 buffer.as_ref(),
@@ -1196,6 +1243,8 @@ struct InnerVirtualPageManager<
     pool:               VirtualPageBufferPool<C, O, B, D, P, I, M>,
     //保留的虚拟页表，不需要持久化
     reserved:           Arc<DashMap<u128, usize>>,
+    //编码器
+    encoder:            Arc<dyn VirtualPageEncoding<Raw = B, Encoded = B>>,
     //块设备列表
     devices:            Arc<DashMap<u32, Arc<dyn BlockDevice<Uid = BU, Status = BS, DetailKey = BK, DetailVal = BV, Detail = BD, Buf = B>>>>,
     //定时同步的间隔时长，单位ms
@@ -1565,6 +1614,7 @@ async fn sync_all_dirty_pages<C, O, B, D, P, I, M, BU, BS, BK, BV, BD>(rt: &Mult
                                                                        table: &VirtualPageTable,
                                                                        pool: &VirtualPageBufferPool<C, O, B, D, P, I, M>,
                                                                        reserved: &Arc<DashMap<u128, usize>>,
+                                                                       encoder: &Arc<dyn VirtualPageEncoding<Raw = B, Encoded = B>>,
                                                                        devices: &Arc<DashMap<u32, Arc<dyn BlockDevice<Uid = BU, Status = BS, DetailKey = BK, DetailVal = BV, Detail = BD, Buf = B>>>>,
                                                                        write_cmd_buffer: &Arc<Mutex<BTreeMap<u64, VirtualPageWriteCmd<C, D>>>>,
                                                                        is_checksum: bool) -> Result<(usize, usize)>
@@ -1595,6 +1645,7 @@ async fn sync_all_dirty_pages<C, O, B, D, P, I, M, BU, BS, BK, BV, BD>(rt: &Mult
         match sync_dirty_page(rt,
                               table,
                               reserved,
+                              encoder,
                               devices,
                               write_cmd_buffer,
                               buffer.as_ref(),
@@ -1626,6 +1677,7 @@ async fn sync_all_dirty_pages<C, O, B, D, P, I, M, BU, BS, BK, BV, BD>(rt: &Mult
 async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntime<()>,
                                                             table: &VirtualPageTable,
                                                             reserved: &Arc<DashMap<u128, usize>>,
+                                                            encoder: &Arc<dyn VirtualPageEncoding<Raw = B, Encoded = B>>,
                                                             devices: &Arc<DashMap<u32, Arc<dyn BlockDevice<Uid = BU, Status = BS, DetailKey = BK, DetailVal = BV, Detail = BD, Buf = B>>>>,
                                                             write_cmd_buffer: &Arc<Mutex<BTreeMap<u64, VirtualPageWriteCmd<C, D>>>>,
                                                             buffer: &PageBuffer<C, O, B, D, P>,
@@ -1679,6 +1731,7 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
                     if let Some(location) = table.addressing(&origin_page_id) {
                         //如果当前缺页的复制的脏页的基页对应的不是空块，则加载对应的原始虚拟页所指定的块位置的块数据，并将块数据反序列化为复制的脏页的基页
                         match read_block(rt,
+                                         encoder,
                                          devices,
                                          offset,
                                          &BlockLocation::new(location),
@@ -1793,7 +1846,8 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
         if copied_page_id.is_normal() {
             //复制的基页是普通页
             let copyed_base_page_clone = copyed_base_page.clone();
-            let copyed_base_page_bin = copyed_base_page.serialize_page();
+            let tmp_page_bin = copyed_base_page.serialize_page();
+            let copyed_base_page_bin = encoder.encode(tmp_page_bin)?; //对复制的基页编码
             let copyed_base_page_buf_len = calc_page_len(&copyed_base_page_bin);
             if new_location.is_empty() {
                 //当前虚拟页是已存储到块设备上的块数据的映射，则需要根据复制的脏页的基页的合并后大小，分配指定块设备的新块
@@ -1834,8 +1888,13 @@ async fn sync_dirty_page<C, O, B, D, P, BU, BS, BK, BV, BD>(rt: &MultiTaskRuntim
             let copyed_base_page_buf = if let Some(entry) = devices.get(&offset) {
                 //指定的块设备存在，则写页头
                 let device = entry.value();
+                let encoding_type = encoder.encoding_type();
+                let encoding_tag = encoding_type.encoding_tag();
+                let encoding_arg = encoding_type.encoding_arg();
                 let block_size = device.block_size(&new_location);
                 write_page_header(copied_page_id.clone().into(),
+                                  encoding_tag,
+                                  encoding_arg,
                                   block_size as u32,
                                   copyed_base_page_bin)
             } else {
@@ -2067,10 +2126,10 @@ async fn alloc_block<BU, BS, BK, BV, BD, BF>(devices: &Arc<DashMap<u32, Arc<dyn 
 }
 
 // 读取页面的页头，返回校验码，时间，页ID，块长度和页体长度
-// 页数据由页头和页体组成，页头长度为36Byte，包括32位校验码，64位时间，128位页ID，32位块长度和32位页体长度
+// 页数据由页头和页体组成，页头长度为38Byte，包括32位校验码，64位时间，128位页ID，8位编码标记，8位编码参数，32位块长度和32位页体长度
 fn read_page_header<B>(location: &BlockLocation,
                        page_buf: &B,
-                       is_checksum: bool) -> Result<(u32, Duration, PageId, u32, u32)>
+                       is_checksum: bool) -> Result<(u32, Duration, PageId, u8, u8, u32, u32)>
     where B: AsRef<[u8]> + Clone + Send + Sync + 'static
 {
     let mut buf = page_buf.as_ref();
@@ -2084,6 +2143,8 @@ fn read_page_header<B>(location: &BlockLocation,
     let checksum = buf.get_u32_le();
     let time = buf.get_u64_le();
     let page_id = buf.get_u128_le();
+    let encoding_tag = buf.get_u8();
+    let encoding_arg = buf.get_u8();
     let block_size = buf.get_u32_le();
     let page_len = buf.get_u32_le();
 
@@ -2092,6 +2153,8 @@ fn read_page_header<B>(location: &BlockLocation,
         let mut hasher = Hasher::new_with_initial_len(0, len as u64 - 4);
         hasher.update(time.to_le_bytes().as_ref());
         hasher.update(page_id.to_le_bytes().as_ref());
+        hasher.update(encoding_tag.to_le_bytes().as_ref());
+        hasher.update(encoding_arg.to_le_bytes().as_ref());
         hasher.update(block_size.to_le_bytes().as_ref());
         hasher.update(page_len.to_le_bytes().as_ref());
         hasher.update(&buf[0..page_len as usize]);
@@ -2113,14 +2176,17 @@ fn read_page_header<B>(location: &BlockLocation,
     Ok((checksum,
         Duration::from_millis(time),
         page_id.into(),
+        encoding_tag,
+        encoding_arg,
         block_size,
         page_len))
 }
 
 // 异步读取指定块设备的指定块位置的页数据，成功返回读取到的块数据
-// 页数据由页头和页体组成，页头长度为36Byte，包括32位校验码，64位时间，128位页ID，32位块长度和32位页体长度
+// 页数据由页头和页体组成，页头长度为38Byte，包括32位校验码，64位时间，128位页ID，8位编码标记，8位编码参数，32位块长度和32位页体长度
 #[inline]
 async fn read_block<BU, BS, BK, BV, BD, BF>(rt: &MultiTaskRuntime<()>,
+                                            encoder: &Arc<dyn VirtualPageEncoding<Raw = BF, Encoded = BF>>,
                                             devices: &Arc<DashMap<u32, Arc<dyn BlockDevice<Uid = BU, Status = BS, DetailKey = BK, DetailVal = BV, Detail = BD, Buf = BF>>>>,
                                             offset: u32,
                                             location: &BlockLocation,
@@ -2158,13 +2224,24 @@ async fn read_block<BU, BS, BK, BV, BD, BF>(rt: &MultiTaskRuntime<()>,
                 },
                 Ok(bin) => {
                     //块设备读取数据成功
-                    let (_checksum, _time, _page_id, _block_size, page_len)
+                    let (_checksum, _time, _page_id, encoding_tag, encoding_arg, _block_size, page_len)
                         = read_page_header(location,
                                            &bin,
                                            is_checksum)?;
 
+                    if encoder.encoding_type() != (encoding_tag, encoding_arg).into() {
+                        //读取数据的编码类型与当前虚拟页管理器的编码器类型不匹配，则立即返回错误原因
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Read block device failed, device: {}, location: {:?}, current: {:?}, real: {:?}, reason: not match encoding type",
+                                                      offset,
+                                                      location,
+                                                      encoder.encoding_type(),
+                                                      VirtualPageEncodingType::from((encoding_tag, encoding_arg)))));
+                    }
+
                     let mut buf = BF::default();
-                    buf.put_slice(&bin.as_ref()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + page_len as usize]); //从块中读取有效页体
+                    let raw_bin = encoder.decode(bin)?;
+                    buf.put_slice(&raw_bin.as_ref()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + page_len as usize]); //从块中读取有效页体
                     return Ok(buf);
                 }
             }
@@ -2186,8 +2263,10 @@ fn calc_page_len<B>(page_body: &B) -> usize
 }
 
 // 为待写入的脏页的基页写入页头
-// 页数据由页头和页体组成，页头长度为36Byte，包括32位校验码，64位时间，128位页ID，32位块长度和32位页体长度
+// 页数据由页头和页体组成，页头长度为38Byte，包括32位校验码，64位时间，128位页ID，8位编码标记，8位编码参数，32位块长度和32位页体长度
 fn write_page_header<B>(page_id: u128,
+                        encoding_tag: u8,
+                        encoding_arg: u8,
                         block_size: u32,
                         page_body: B) -> B
     where B: BufMut + AsRef<[u8]> + AsMut<[u8]> + Default + Clone + Send + Sync + 'static
@@ -2202,6 +2281,8 @@ fn write_page_header<B>(page_id: u128,
     let mut hasher = Hasher::new_with_initial_len(0, buf_len as u64 - 4);
     hasher.update(time.to_le_bytes().as_ref());
     hasher.update(page_id.to_le_bytes().as_ref());
+    hasher.update(encoding_tag.to_le_bytes().as_slice());
+    hasher.update(encoding_arg.to_le_bytes().as_slice());
     hasher.update(block_size.to_le_bytes().as_ref());
     hasher.update(base_page_len.to_le_bytes().as_ref());
     hasher.update(page_body.as_ref());
@@ -2211,6 +2292,8 @@ fn write_page_header<B>(page_id: u128,
     buf.put_u32_le(checksum);
     buf.put_u64_le(time);
     buf.put_u128_le(page_id);
+    buf.put_u8(encoding_tag);
+    buf.put_u8(encoding_arg);
     buf.put_u32_le(block_size);
     buf.put_u32_le(base_page_len);
     buf.put_slice(page_body.as_ref());
@@ -2219,7 +2302,7 @@ fn write_page_header<B>(page_id: u128,
 }
 
 // 异步向指定块设备的指定块位置写入页数据，成功返回写入的数据大小
-// 页数据由页头和页体组成，页头长度为36Byte，包括32位校验码，64位时间，128位页ID，32位块长度和32位页体长度
+// 页数据由页头和页体组成，页头长度为38Byte，包括32位校验码，64位时间，128位页ID，8位编码标记，8位编码参数，32位块长度和32位页体长度
 #[inline]
 async fn write_block<BU, BS, BK, BV, BD, BF>(rt: &MultiTaskRuntime<()>,
                                              devices: &Arc<DashMap<u32, Arc<dyn BlockDevice<Uid = BU, Status = BS, DetailKey = BK, DetailVal = BV, Detail = BD, Buf = BF>>>>,
@@ -2274,6 +2357,51 @@ async fn write_block<BU, BS, BK, BV, BD, BF>(rt: &MultiTaskRuntime<()>,
                                offset,
                                location,
                                size)))
+    }
+}
+
+///
+/// 虚拟页管理器的内部页迭代器
+///
+#[derive(Debug, Clone)]
+pub struct InternalPageIterator {
+    vpm_uid:                u32,    //虚拟页管理器的唯一ID
+    last_internal_page_uid: u64,    //最近内部页唯一ID
+    is_finish:              bool,   //是否迭代完成
+}
+
+impl Iterator for InternalPageIterator {
+    type Item = PageId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_finish {
+            //迭代已完成，则立即返回空
+            return None;
+        }
+
+        let item = create_page_id(self.vpm_uid,
+                       0,
+                       self.last_internal_page_uid);
+
+        if self.last_internal_page_uid == 0 {
+            //迭代已完成
+            self.is_finish = true;
+            Some(item)
+        } else {
+            //可以继续迭代
+            self.last_internal_page_uid -= 1;
+            Some(item)
+        }
+    }
+}
+
+impl InternalPageIterator {
+    /// 获取迭代器当前可迭代数量
+    pub fn len(&self) -> u64 {
+        if self.is_finish {
+            return 0;
+        }
+        self.last_internal_page_uid + 1
     }
 }
 

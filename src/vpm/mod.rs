@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::collections::VecDeque;
 use std::io::{Error, Result as IOResult, ErrorKind};
+use std::marker::PhantomData;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::sync::atomic::AtomicU64;
 
@@ -28,6 +29,16 @@ const VIRTUAL_PAGE_MANAGER_DEVICES_INDEX: u32 = 0;
 /// 写指令的空编号，用于表示不存在或不可用的写指令
 ///
 const EMPTY_WRITE_INDEX: u64 = 0;
+
+///
+/// 默认的编码标记
+///
+const DEFAULT_ENCODING_TAG: u8 = 0;
+
+///
+/// 默认的编码参数
+///
+const DEFAULT_ENCODING_ARG: u8 = 0;
 
 ///
 /// 虚拟页的写增量
@@ -575,3 +586,114 @@ impl WriteIndex {
         self.0 == EMPTY_WRITE_INDEX
     }
 }
+
+///
+/// 虚拟页编码
+///
+pub trait VirtualPageEncoding: Send + Sync + 'static {
+    // 原始类型
+    type Raw: AsRef<[u8]> + Send + Sync + 'static;
+    // 编码后类型
+    type Encoded: AsRef<[u8]> + Send + Sync + 'static;
+
+    /// 获取虚拟页编码的类型
+    fn encoding_type(&self) -> VirtualPageEncodingType;
+
+    /// 对指定输入进行编码
+    fn encode(&self, raw: Self::Raw) -> IOResult<Self::Encoded>;
+
+    /// 对指定输入进行解码
+    fn decode(&self, encoded: Self::Encoded) -> IOResult<Self::Raw>;
+}
+
+///
+/// 虚拟页编码类型
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualPageEncodingType {
+    Empty,      //空类型
+    LZ4(u8),    //LZ4编码类型
+}
+
+impl From<(u8, u8)> for VirtualPageEncodingType {
+    fn from((tag, arg): (u8, u8)) -> Self {
+        match tag {
+            0 => VirtualPageEncodingType::Empty,
+            _ => VirtualPageEncodingType::LZ4(arg),
+        }
+    }
+}
+
+impl From<VirtualPageEncodingType> for (u8, u8) {
+    fn from(value: VirtualPageEncodingType) -> Self {
+        match value {
+            VirtualPageEncodingType::Empty => (DEFAULT_ENCODING_TAG, DEFAULT_ENCODING_ARG),
+            VirtualPageEncodingType::LZ4(tag) => (1, tag),
+        }
+    }
+}
+
+impl VirtualPageEncodingType {
+    /// 构建一个空类型
+    pub fn empty() -> VirtualPageEncodingType {
+        VirtualPageEncodingType::Empty
+    }
+
+    /// 构建一个LZ编码类型
+    pub fn with_lz4(level: u8) -> VirtualPageEncodingType {
+        VirtualPageEncodingType::LZ4(level)
+    }
+
+    /// 获取编码标记
+    pub fn encoding_tag(&self) -> u8 {
+        match self {
+            VirtualPageEncodingType::Empty => DEFAULT_ENCODING_TAG,
+            VirtualPageEncodingType::LZ4(_) => 1,
+        }
+    }
+
+    /// 获取编码参数
+    pub fn encoding_arg(&self) -> u8 {
+        match self {
+            VirtualPageEncodingType::Empty => DEFAULT_ENCODING_ARG,
+            VirtualPageEncodingType::LZ4(tag) => *tag,
+        }
+    }
+}
+
+///
+/// 默认虚拟页编码器
+///
+#[derive(Debug, Clone)]
+pub struct DefaultVirtualPageEncoder<B: AsRef<[u8]> + Send + Sync + 'static>{
+    encoding_type:  VirtualPageEncodingType,    //编码类型
+    marker:         PhantomData<B>,
+}
+
+impl<B: AsRef<[u8]> + Send + Sync + 'static> Default for DefaultVirtualPageEncoder<B> {
+    fn default() -> Self {
+        DefaultVirtualPageEncoder {
+            encoding_type: VirtualPageEncodingType::empty(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<B: AsRef<[u8]> + Send + Sync + 'static> VirtualPageEncoding for DefaultVirtualPageEncoder<B> {
+    type Raw = B;
+    type Encoded = B;
+
+    fn encoding_type(&self) -> VirtualPageEncodingType {
+        self.encoding_type
+    }
+
+    fn encode(&self, raw: Self::Raw) -> IOResult<Self::Encoded> {
+        Ok(raw)
+    }
+
+    fn decode(&self, encoded: Self::Encoded) -> IOResult<Self::Raw> {
+        Ok(encoded)
+    }
+}
+
+
