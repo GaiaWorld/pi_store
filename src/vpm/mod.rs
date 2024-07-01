@@ -14,6 +14,7 @@ pub mod page_manager;
 pub mod page_pool;
 pub mod page_table;
 pub mod page_cache;
+pub mod utils;
 
 ///
 /// 虚拟页表中的空页，用于表示不存在或不可用的页，在持久化时用于描述虚拟页表的元信息所在的页
@@ -603,7 +604,7 @@ pub trait VirtualPageEncoding: Send + Sync + 'static {
     fn encode(&self, raw: Self::Raw) -> IOResult<Self::Encoded>;
 
     /// 对指定输入进行解码
-    fn decode(&self, encoded: Self::Encoded) -> IOResult<Self::Raw>;
+    fn decode(&self, encoded: Self::Encoded, page_len: usize) -> IOResult<Self::Raw>;
 }
 
 ///
@@ -629,6 +630,26 @@ impl From<VirtualPageEncodingType> for (u8, u8) {
         match value {
             VirtualPageEncodingType::Empty => (DEFAULT_ENCODING_TAG, DEFAULT_ENCODING_ARG),
             VirtualPageEncodingType::LZ4(tag) => (1, tag),
+        }
+    }
+}
+
+impl VirtualPageEncodingType {
+    /// 判断是否是空类型
+    pub fn is_empty(&self) -> bool {
+        if let VirtualPageEncodingType::Empty = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 判断是否是LZ4编码类型
+    pub fn is_lz4(&self) -> bool {
+        if let VirtualPageEncodingType::LZ4(_) = self {
+            true
+        } else {
+            false
         }
     }
 }
@@ -691,7 +712,7 @@ impl<B: AsRef<[u8]> + Send + Sync + 'static> VirtualPageEncoding for DefaultVirt
         Ok(raw)
     }
 
-    fn decode(&self, encoded: Self::Encoded) -> IOResult<Self::Raw> {
+    fn decode(&self, encoded: Self::Encoded, _page_len: usize) -> IOResult<Self::Raw> {
         Ok(encoded)
     }
 }

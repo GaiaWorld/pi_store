@@ -68,7 +68,7 @@ const DEFAULT_TABLE_DELAY_TIMEOUT: usize = 1;
 ///
 /// 页头大小，单位B
 ///
-const PAGE_HEADER_SIZE: usize = 38;
+pub(crate) const PAGE_HEADER_SIZE: usize = 38;
 
 ///
 /// 默认的页写增量缓冲大小限制，单位B
@@ -2240,8 +2240,14 @@ async fn read_block<BU, BS, BK, BV, BD, BF>(rt: &MultiTaskRuntime<()>,
                     }
 
                     let mut buf = BF::default();
-                    let raw_bin = encoder.decode(bin)?;
-                    buf.put_slice(&raw_bin.as_ref()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + page_len as usize]); //从块中读取有效页体
+                    if encoder.encoding_type().is_empty() {
+                        //从块中读取有效页体
+                        buf.put_slice(&bin.as_ref()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + page_len as usize]);
+                    } else {
+                        //从块中读取解码后的有效页体
+                        let raw_bin = encoder.decode(bin, page_len as usize)?;
+                        buf.put_slice(raw_bin.as_ref());
+                    }
                     return Ok(buf);
                 }
             }

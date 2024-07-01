@@ -30,7 +30,8 @@ use pi_store::{vpm::{VirtualPageWriteDelta, VirtualPageBuf, PageId,
                      page_table::VirtualPageTable,
                      page_pool::{VirtualPageCachingStrategy,
                                  PageBuffer},
-                     page_manager::{VirtualPageManagerBuilder, VirtualPageManager}},
+                     page_manager::{VirtualPageManagerBuilder, VirtualPageManager},
+                     utils::LZ4EncoderBuilder},
                devices::simple_device::{Binary, SimpleDevice}};
 use pi_blocks_allocator::device::{BuddyBlocksDeviceBuilder, BuddyBlocksDevice};
 
@@ -347,9 +348,12 @@ impl VirtualPageWriteDelta for TestWriteDelta {
             1 => {
                 ("Hello ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
             },
-            _ => {
+            2 => {
                 ("This is super block ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
-            }
+            },
+            _ => {
+                ("HelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHelloHello ".to_string() + self.copy_page_id.page_uid().to_string().as_str()).into_bytes()
+            },
         }
     }
 }
@@ -374,6 +378,10 @@ impl TestWriteDelta {
         } else {
             unimplemented!()
         }
+    }
+
+    pub fn set_delta_type(&mut self, delta_type: usize) {
+        self.delta_type = delta_type;
     }
 }
 
@@ -1221,6 +1229,149 @@ fn test_virtual_page_manager_load_and_copy_on_write_and_free() {
                     .alloc_page(1, 16) ;
                 cmd.append(TestWriteDelta::new(current_page_id.clone(),
                                                new_page_id.clone()));
+
+                //为写指令增加1个后续增量，后续增量写入分配的内部页
+                let new_follow_up_page_id = page_manager
+                    .alloc_page(0, 32);
+                cmd.follow_up(TestWriteDelta::new(new_follow_up_page_id.clone(),
+                                                  new_follow_up_page_id.clone()));
+
+                match page_manager.write_through(cmd, Some(1000), true).await {
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        println!("Write through failed, reason: {:?}", e);
+                    },
+                    Err(e) => {
+                        panic!("Write through failed, reason: {:?}", e);
+                    },
+                    Ok(r) => {
+                        println!("!!!!!!Write through ok, cmd index: {}", *r);
+
+                        if !current_page_id.is_empty()
+                            && !current_follow_up_page_id.is_empty() {
+                            //原始页面不是空页面，则立即释放原始页面
+                            let r0 = page_manager.free_page(current_page_id.clone());
+                            let r1 = page_manager.free_page(current_follow_up_page_id.clone());
+                            if r0 && r1 {
+                                println!("!!!!!!Free page ok, current_page_id: {:?}, current_follow_up_page_id: {:?}",
+                                         current_page_id,
+                                         current_follow_up_page_id);
+                            } else {
+                                println!("!!!!!!Free page failed, current_page_id: {:?}/{:?}, current_follow_up_page_id: {:?}/{:?}, ",
+                                         current_page_id,
+                                         r0,
+                                         current_follow_up_page_id,
+                                         r1);
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    });
+
+    thread::sleep(Duration::from_millis(1000000000));
+}
+
+// 加载已有页面，并写时复制的方式更新已有页面，并释放更新后的原始页面
+// 初始化时使用空页面进行写时复制的更新
+// 页面根据需要进行压缩编码
+#[test]
+fn test_virtual_page_manager_load_and_copy_on_write_and_free_by_compress() {
+    //启动日志系统
+    env_logger::builder().format_timestamp_millis().init();
+    let _handle = startup_global_time_loop(100);
+    let builder = MultiTaskRuntimeBuilder::default();
+    let rt = builder.build();
+
+    init_global_virtual_page_lfu_cache_allocator::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>(rt.clone(),
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           1024,
+                                                                                                           10 * 1024 * 1024,
+                                                                                                           5000);
+
+    let rt_copy = rt.clone();
+    rt.spawn(async move {
+        let device = BuddyBlocksDeviceBuilder::new("./device")
+            .build(rt_copy.clone())
+            .await
+            .unwrap();
+
+        let encoder = LZ4EncoderBuilder::new().build();
+        let cache = VirtualPageLFUCache::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new();
+        let page_manager = VirtualPageManagerBuilder::new(1,
+                                                          rt_copy.clone(),
+                                                          "./page_table",
+                                                          cache)
+            .set_init_page_uid(1)
+            .set_table_log_file_limit(32 * 1024 * 1024)
+            .set_table_load_buf_len(8192)
+            .set_pool_buffer_delta_limit(8192)
+            .set_table_delay_timeout(1)
+            .set_encoder(encoder)
+            .build()
+            .await;
+        page_manager.startup_collecting();
+
+        let r = page_manager.join_device(1, Arc::new(device));
+        assert!(r);
+        register_release_handler(1,
+                                 Arc::new(TestPageBufRelease::<Vec<u8>, Vec<u8>, Vec<u8>, TestWriteDelta, TestPageBuf>::new(page_manager.clone())));
+        startup_auto_collect(rt_copy.clone(), 5000);
+
+        //加载虚拟页表中的所有虚拟页
+        let mut count = 0;
+        match page_manager.load_all(true).await {
+            Err(e) => {
+                println!("!!!!!!loaded failed, reason: {:?}", e);
+            },
+            Ok(mut page_ids) => {
+                let mut current_page_id = PageId::empty();
+                let mut current_follow_up_page_id = PageId::empty();
+
+                page_ids.sort();
+                for page_id in page_ids {
+                    if page_id.is_normal() {
+                        match page_manager.read(None, &page_id, true).await {
+                            Err(e) => {
+                                println!("!!!!!!load failed, page_id: {:?}, reason: {:?}", page_id, e);
+                            },
+                            Ok(None) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                            },
+                            Ok(Some(output)) => {
+                                println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                         page_id,
+                                         String::from_utf8_lossy(output.as_ref()));
+                                count += 1;
+                                current_page_id = page_id;
+                            },
+                        }
+                    } else if page_id.is_internal() {
+                        if let Some(output) = page_manager.read_internal(&page_id) {
+                            println!("!!!!!!load ok, page_id: {:?}, data: {:?}",
+                                     page_id,
+                                     String::from_utf8_lossy(output.as_ref()));
+                            count += 1;
+                            current_follow_up_page_id = page_id;
+                        } else {
+                            println!("!!!!!!load ok, page_id: {:?}, data: None", page_id);
+                        }
+                    } else {
+                        unimplemented!()
+                    }
+                }
+                println!("!!!!!!loaded finish, count: {}", count);
+
+                //初始化写指令
+                let mut cmd = VirtualPageWriteCmd::new();
+
+                //为写指令增加1个增量
+                let new_page_id = page_manager
+                    .alloc_page(1, 16) ;
+                let mut delta = TestWriteDelta::new(current_page_id.clone(),
+                                                    new_page_id.clone());
+                delta.set_delta_type(3);
+                cmd.append(delta);
 
                 //为写指令增加1个后续增量，后续增量写入分配的内部页
                 let new_follow_up_page_id = page_manager
