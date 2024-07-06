@@ -1,11 +1,15 @@
-use std::ptr;
 use std::time::Instant;
 use std::hint::spin_loop;
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 use std::collections::VecDeque;
 use std::cmp::{Ord, PartialOrd, Eq, PartialEq, Ordering};
-use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, AtomicPtr, Ordering as AtomicOrdering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, AtomicPtr, Ordering as AtomicOrdering}};
+
+use parking_lot::Mutex;
+use crossbeam_channel::{Sender, Receiver, unbounded};
+use quanta::Instant as QInstant;
+use log::trace;
 
 use crate::vpm::PageId;
 
@@ -14,6 +18,12 @@ const DEFAULT_MIN_B: usize = 4;
 
 /// 默认的最大块系数
 const DEFAULT_MAX_B: usize = 65535;
+
+/// 不自动整理阈值
+const NOT_AUTO_COLLECTING_THRESHOLD: usize = 0;
+
+/// 默认的自动整理阈值
+const DEFAULT_AUTO_COLLECTING_THRESHOLD: usize = 8;
 
 ///
 /// 写时复制的无锁并发B+树映射表
@@ -48,11 +58,21 @@ impl<
         let leaf = Arc::new(Leaf::<K, V>::empty(b));
         let node = Arc::new(Node::Leaf(leaf.clone()));
         let root = AtomicPtr::new(Arc::into_raw(node) as *mut Node<K, V>);
+        let (previous_generations_sender, previous_generations_receiver) = unbounded();
+        let (swap_generations_sender, swap_generations_receiver) = unbounded();
+        let recyclable = Mutex::new(Vec::new());
         let inner = InnerCowBtreeMap {
             b,
             length: AtomicU64::new(0),
             depth: AtomicUsize::new(0),
+            write_lock: AtomicBool::new(false),
             root,
+            auto_collecting_threshold: AtomicUsize::new(DEFAULT_AUTO_COLLECTING_THRESHOLD),
+            previous_generations_sender,
+            previous_generations_receiver,
+            swap_generations_sender,
+            swap_generations_receiver,
+            recyclable,
         };
 
         CowBtreeMap(Arc::new(inner))
@@ -70,8 +90,8 @@ impl<
         map
     }
 
-    /// 对指定的原树进行复制，对复制的树进行的所有修改，都不会影响原树
-    /// 只有在对复制的树进行手动提交后，原树才会被修改
+    /// 对指定的原树进行深度复制，对深度复制的树进行的所有修改，都不会影响原树
+    /// 只有在对深度复制的树进行手动提交后，原树才会被修改
     pub fn copy(source: &Self) -> Self {
         //复制块系数、键值对数据和树的深度
         let b = source.b_factor();
@@ -79,16 +99,24 @@ impl<
         let depth = AtomicUsize::new(source.depth());
 
         //深度复制树的根节点
-        let (_raw, shared_root) = safety_borrow_root(&source.0.root, 3);
-        let root_copy = shared_root.copy_on_write();
-        let raw = Arc::into_raw(Arc::new(root_copy)) as *mut Node<K, V>;
+        let (_raw, shared_root) = safety_borrow_root(&source.0.root);
+        let raw = Arc::into_raw(Arc::new(shared_root)) as *mut Node<K, V>;
         let root = AtomicPtr::new(raw);
-
+        let (previous_generations_sender, previous_generations_receiver) = unbounded();
+        let (swap_generations_sender, swap_generations_receiver) = unbounded();
+        let recyclable = Mutex::new(Vec::new());
         let inner = InnerCowBtreeMap {
             b,
             length,
             depth,
+            write_lock: AtomicBool::new(false),
             root,
+            auto_collecting_threshold: AtomicUsize::new(DEFAULT_AUTO_COLLECTING_THRESHOLD),
+            previous_generations_sender,
+            previous_generations_receiver,
+            swap_generations_sender,
+            swap_generations_receiver,
+            recyclable,
         };
         CowBtreeMap(Arc::new(inner))
     }
@@ -119,11 +147,9 @@ impl<
 
     /// 获取最小关键字
     pub fn min_key<'a>(&self) -> Option<KeyRefGuard<'a, K, V>> {
-        let (raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        let (raw, shared_root) = safety_borrow_root(&self.0.root);
 
-        let root = unsafe {
-            &*raw
-        };
+        let root = unsafe { &*raw };
         let mut node = root;
 
         loop {
@@ -150,11 +176,9 @@ impl<
 
     /// 获取最大关键字
     pub fn max_key<'a>(&self) -> Option<KeyRefGuard<'a, K, V>> {
-        let (raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        let (raw, shared_root) = safety_borrow_root(&self.0.root);
 
-        let root = unsafe {
-            &*raw
-        };
+        let root = unsafe { &*raw };
         let mut node = root;
 
         loop {
@@ -185,12 +209,10 @@ impl<
     }
 
     /// 查询指定关键字的值的只读引用
-    pub fn get<'a>(&self, key: &'a K) -> Option<ValueRefGuard<'a, K, V>> {
-        let (raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+    pub fn get<'a>(&'a self, key: &'a K) -> Option<ValueRefGuard<'a, K, V>> {
+        let (raw, shared_root) = safety_borrow_root(&self.0.root);
 
-        let root = unsafe {
-            &*raw
-        };
+        let root = unsafe { &*raw };
         if let Ok(value) = query(root, key, false, &mut Vec::new()) {
             Some(ValueRefGuard {
                 root: shared_root,
@@ -205,7 +227,7 @@ impl<
     pub fn keys<'a>(&'a self,
                     key: Option<&'a K>,
                     descending: bool) -> KeyIterator<'a, K, V> {
-        let (_raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        let (_raw, shared_root) = safety_borrow_root(&self.0.root);
         if descending {
             KeyIterator::Descending(KeyDescendingIterator::new(self, shared_root, key))
         } else {
@@ -217,7 +239,7 @@ impl<
     pub fn values<'a>(&'a self,
                       key: Option<&'a K>,
                       descending: bool) -> KVPairIterator<'a, K, V> {
-        let (_raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        let (_raw, shared_root) = safety_borrow_root(&self.0.root);
         if descending {
             KVPairIterator::Descending(KVPairDescendingIterator::new(self, shared_root, key))
         } else {
@@ -226,16 +248,60 @@ impl<
     }
 
     /// 插入或更新指定关键字的值，成功则返回指定关键字的旧值，超时则返回原关键字和值
+    /// 并发插入，更新或删除时，有可能出现冲突，可以设置合适的超时时间来避让冲突
     pub fn upsert(&self,
                   key: K,
                   value: V,
                   timeout: Option<u128>) -> Result<Option<V>, (K, V)> {
-        let (raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        if let Some(timeout) = timeout {
+            //指定了并发写操作的超时时长
+            let now = QInstant::recent();
+            loop {
+                if now.elapsed().as_millis() > timeout {
+                    //写锁等待超时
+                    return Err((key, value));
+                }
 
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        } else {
+            //未指定并发写操作的超时时长
+            loop {
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        }
+
+        let (raw, shared_root) = safety_borrow_root(&self.0.root);
         let mut nodes = Vec::with_capacity(self.depth() + 1); //初始化查询栈
-        let root = unsafe {
-            &*raw
-        };
+        let root = unsafe { &*raw };
         let result = query(root, &key, true, &mut nodes);
         match result {
             Err(index) => {
@@ -246,12 +312,23 @@ impl<
                            key.clone(),
                            value.clone()); //插入指定关键字的键值对
 
-                if let None = safety_modify_tree(self, new, timeout) {
-                    //安全的修改树超时，则立即返回原关键字和值
-                    return Err((key, value));
+                match safety_modify_tree(self, new, timeout) {
+                    None => {
+                        //安全的修改树超时，则立即返回原关键字和值
+                        return Err((key, value));
+                    },
+                    Some(old_root) => {
+                        self
+                            .0
+                            .previous_generations_sender
+                            .send(old_root)
+                            .expect("Upsert cow b plus tree failed");
+                        self.auto_collecting_previous_generation();
+                    },
                 }
-                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的独占引用，保证旧根节点在共享引用计数清0后释放
 
+                self.0.write_lock.store(false, AtomicOrdering::Release);
                 self.0.length.fetch_add(1, AtomicOrdering::Release);
                 Ok(None)
             },
@@ -259,12 +336,23 @@ impl<
                 //指定关键字的值存在，则更新
                 let (new, last_value) = update(&mut nodes, &key, value.clone()); //更新指定关键字的值
 
-                if let None = safety_modify_tree(self, new, timeout) {
-                    //安全的修改树超时，则立即返回原关键字和值
-                    return Err((key, value));
+                match safety_modify_tree(self, new, timeout) {
+                    None => {
+                        //安全的修改树超时，则立即返回原关键字和值
+                        return Err((key, value));
+                    },
+                    Some(old_root) => {
+                        self
+                            .0
+                            .previous_generations_sender
+                            .send(old_root)
+                            .expect("Upsert cow b plus tree failed");
+                        self.auto_collecting_previous_generation();
+                    },
                 }
-                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
+                drop(shared_root); //安全的修改树成功，则立即释放旧根节点的独占引用，保证旧根节点在共享引用计数清0后释放
 
+                self.0.write_lock.store(false, AtomicOrdering::Release);
                 Ok(Some(last_value))
             },
         }
@@ -281,32 +369,89 @@ impl<
     }
 
     /// 移除指定关键字的值，成功则返回指定关键字的值，超时则返回原关键字的引用
+    /// 并发插入，更新或删除时，有可能出现冲突，可以设置合适的超时时间来避让冲突
     pub fn remove<'a>(&'a self,
                       key: &'a K,
                       timeout: Option<u128>) -> Result<Option<V>, &'a K> {
-        let (raw, shared_root) = safety_borrow_root(&self.0.root, 3);
+        if let Some(timeout) = timeout {
+            //指定了并发写操作的超时时长
+            let now = QInstant::recent();
+            loop {
+                if now.elapsed().as_millis() > timeout {
+                    //写锁等待超时
+                    return Err((key));
+                }
 
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        } else {
+            //未指定并发写操作的超时时长
+            loop {
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        }
+
+        let (raw, shared_root) = safety_borrow_root(&self.0.root);
         let mut nodes = Vec::with_capacity(self.depth() + 1); //初始化查询栈
-        let root = unsafe {
-            &*raw
-        };
+        let root = unsafe { &*raw };
         let result = query(root, &key, true, &mut nodes);
         match result {
             Err(_index) => {
                 //指定关键字的值不存在，则返回
                 drop(shared_root); //保证旧根节点在共享引用计数清0后释放
+
+                self.0.write_lock.store(false, AtomicOrdering::Release);
                 Ok(None)
             },
             Ok(_last_value) => {
                 //指定关键字的值存在，则更新
                 let (new, last_value) = delete(&mut nodes, key).unwrap(); //删除指定关键字的键值对
 
-                if let None = safety_modify_tree(self, new, timeout) {
-                    //安全的修改树超时，则立即返回原关键字和值
-                    return Err(key);
+                match safety_modify_tree(self, new, timeout) {
+                    None => {
+                        //安全的修改树超时，则立即返回原关键字和值
+                        return Err(key);
+                    },
+                    Some(old_root) => {
+                        self
+                            .0
+                            .previous_generations_sender
+                            .send(old_root)
+                            .expect("Remove cow b plus tree failed");
+                        self.auto_collecting_previous_generation();
+                    },
                 }
                 drop(shared_root); //安全的修改树成功，则立即释放旧根节点的共享引用，保证旧根节点在共享引用计数清0后释放
 
+                self.0.write_lock.store(false, AtomicOrdering::Release);
                 self.0.length.fetch_sub(1, AtomicOrdering::Release);
                 Ok(Some(last_value))
             },
@@ -323,67 +468,188 @@ impl<
     }
 
     /// 清空所有键值对
+    /// 并发插入，更新或删除时，有可能出现冲突，可以设置合适的超时时间来避让冲突
     pub fn clear(&self, timeout: Option<u128>) -> bool {
+        if let Some(timeout) = timeout {
+            //指定了并发写操作的超时时长
+            let now = QInstant::recent();
+            loop {
+                if now.elapsed().as_millis() > timeout {
+                    //写锁等待超时
+                    return false;
+                }
+
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        } else {
+            //未指定并发写操作的超时时长
+            loop {
+                match self
+                    .0
+                    .write_lock
+                    .compare_exchange(false,
+                                      true,
+                                      AtomicOrdering::AcqRel,
+                                      AtomicOrdering::Acquire) {
+                    Err(_) => {
+                        let _ = spin(5);
+                        continue;
+                    },
+                    Ok(_) => {
+                        break;
+                    },
+                }
+            }
+        }
+
         let b = self.b_factor();
         let new = (b, Arc::new(Node::Leaf(Arc::new(Leaf::empty(b)))));
 
-        if let None = safety_modify_tree(self, new, timeout) {
-            //安全的修改树超时，则立即返回
-            return false;
+        match safety_modify_tree(self, new, timeout) {
+            None => {
+                //安全的修改树超时，则立即返回
+                self.0.write_lock.store(false, AtomicOrdering::Release);
+                return false;
+            },
+            Some(old_root) => {
+                self
+                    .0
+                    .previous_generations_sender
+                    .send(old_root)
+                    .expect("Clear cow b plus tree failed");
+                self.auto_collecting_previous_generation();
+            },
         }
 
         self.0.length.store(0, AtomicOrdering::Release);
+        self.0.depth.store(0, AtomicOrdering::Release);
+        self.0.write_lock.store(false, AtomicOrdering::Release);
         true
+    }
+
+    /// 获取自动整理的阈值
+    pub fn auto_collecting_threshold(&self) -> usize {
+        self
+            .0
+            .auto_collecting_threshold
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// 设置自动整理的阈值
+    pub fn set_auto_collecting_threshold(&self, threshold: usize) {
+        self
+            .0
+            .auto_collecting_threshold
+            .store(threshold, AtomicOrdering::Relaxed);
+    }
+
+    /// 线程安全的整理旧世代，返回整理后的剩余旧世代数量和整理时移除的旧世代数量
+    /// 并发调用此方法可能导致线程阻塞
+    pub fn collecting_previous_generation(&self) -> (usize, usize) {
+        //移除可回收的旧世代
+        let mut recyclable_locked = self
+            .0
+            .recyclable
+            .lock();
+        let removed = recyclable_locked.len();
+        recyclable_locked.clear();
+
+        while let Ok(previous_root) = self.0.swap_generations_receiver.try_recv() {
+            if Arc::strong_count(&previous_root) == 1 {
+                //将可回收的旧世代放入可回收列表中
+                recyclable_locked.push(previous_root);
+                continue;
+            }
+
+            //保留正在被引用的旧世代，从临时缓冲区中再次加入发送器
+            self
+                .0
+                .previous_generations_sender
+                .send(previous_root)
+                .unwrap();
+        }
+
+        //采集待回收的旧世代
+        while let Ok(previous_root) = self.0.previous_generations_receiver.try_recv() {
+            if Arc::strong_count(&previous_root) == 1 {
+                //将可回收的旧世代放入可回收列表中
+                recyclable_locked.push(previous_root);
+                continue;
+            }
+
+            //保留正在被引用的旧世代，加入临时缓冲区
+            self
+                .0
+                .swap_generations_sender
+                .send(previous_root)
+                .unwrap();
+        }
+
+        (self.0.swap_generations_receiver.len(),
+         removed)
+    }
+
+    /// 线程安全的根据阈值整理旧世代
+    pub(crate) fn auto_collecting_previous_generation(&self) {
+        let threshold = self
+            .0
+            .auto_collecting_threshold
+            .load(AtomicOrdering::Relaxed);
+        if threshold == NOT_AUTO_COLLECTING_THRESHOLD {
+            //忽略自动整理
+            return;
+        }
+
+        let current = self.0.previous_generations_receiver.len()
+            + self.0.recyclable.lock().len();
+
+        if current < threshold {
+            //未达自动整理的阈值，则忽略本次自动整理
+            return;
+        }
+
+        //已达自动整理的阈值，则开始本次自动整理
+        let (previous, recyclabled) = self.collecting_previous_generation();
+        trace!("Auto collection previous generation succeeded, previous: {:?}, recyclabled: {:?}",
+            previous,
+            recyclabled);
     }
 }
 
 // 安全的借用指定根节点的共享引用，并增加根节点共享引用的计数，返回根节点的指针和根节点的共享引用
 // 因为借用了根节点的共享引用，所以可以保证在使用根节点的指针时，根节点不会被释放
-// 注意根节点的共享引用被释放后，根节点的指针将不再安全
+// 注意根节点的共享引用被释放后，根节点的任何指针访问将不再安全
 #[inline]
-fn safety_borrow_root<K, V>(root: &AtomicPtr<Node<K, V>>, retry: u32) -> (*mut Node<K, V>, Arc<Node<K, V>>)
+fn safety_borrow_root<K, V>(root: &AtomicPtr<Node<K, V>>) -> (*mut Node<K, V>, Arc<Node<K, V>>)
     where K: Ord + Debug + Clone + Send + 'static,
-          V: Debug + Clone + Send + 'static {
-    let mut raw = root.load(AtomicOrdering::Acquire);
-    loop {
-        if raw.is_null() {
-            //替换失败，其它操作正在借用指定根节点的共享引用，则自旋后再次获取当前根节点，并重试
-            spin(retry);
-            raw = root.load(AtomicOrdering::Acquire);
-            continue;
-        }
-
-        match root.compare_exchange_weak(raw,
-                                         ptr::null_mut(),
-                                         AtomicOrdering::AcqRel,
-                                         AtomicOrdering::Acquire) {
-            Err(new_raw) => {
-                if new_raw.is_null() {
-                    //替换失败，其它操作正在借用指定根节点的共享引用，则自旋后再次获取当前根节点，并重试
-                    spin(retry);
-                    raw = root.load(AtomicOrdering::Acquire);
-                    continue;
-                } else {
-                    //替换失败，其它操作已经更新了根节点，则自旋后重试
-                    raw = new_raw;
-                    spin(retry);
-                    continue;
-                }
-            },
-            Ok(current_raw) => {
-                //替换成功
-                let shared_root = unsafe { Arc::from_raw(current_raw as *mut Node<K, V>) };
-                let shared_root_copy = shared_root.clone(); //复制当前根节点的共享引用
-                root.store(current_raw, AtomicOrdering::Release); //恢复被替换的当前根节点
-                let _ = Arc::into_raw(shared_root); //防止被提前释放
-                return (raw, shared_root_copy);
-            },
-        }
-    }
+          V: Debug + Clone + Send + 'static
+{
+    //借用根节点的共享引用
+    let raw = root.load(AtomicOrdering::Acquire);
+    let shared_root = unsafe { Arc::from_raw(raw) };
+    let shared_root_copy = shared_root.clone(); //复制当前根节点的共享引用
+    let _ = Arc::into_raw(shared_root); //防止被提前释放
+    debug_assert!(Arc::strong_count(&shared_root_copy) >= 2);
+    return (raw, shared_root_copy);
 }
 
 // 安全的替换当前根节点的共享引用，成功返回上一个根节点的共享引用，超时返回空
 // 上一个根节点会在所有借用了上一个根节点的共享引用都回收时释放
+// 并发插入，更新或删除时会并发的替换当前根节点的共享引用，有可能出现冲突，可以设置合适的超时时间来避让冲突
 #[inline]
 fn safety_replace_root<K, V>(current: &AtomicPtr<Node<K, V>>,
                              new: Arc<Node<K, V>>,
@@ -392,39 +658,25 @@ fn safety_replace_root<K, V>(current: &AtomicPtr<Node<K, V>>,
     where K: Ord + Debug + Clone + Send + 'static,
           V: Debug + Clone + Send + 'static {
     let mut current_raw = current.load(AtomicOrdering::Acquire);
-    let mut new_raw = Arc::into_raw(new) as *mut Node<K, V>;
+    let new_raw = Arc::into_raw(new) as *mut Node<K, V>;
 
     if let Some(timeout) = timeout {
         //指定了替换重试的超时时长，则在替换失败时继续重试，直到达到超时时间
         let now = Instant::now();
-        while now.elapsed().as_millis() > timeout {
-            if current_raw.is_null() {
-                //替换失败，其它操作正在借用当产胆根节点的共享引用，则自旋后再次获取当前根节点，并重试
-                spin(retry);
-                current_raw = current.load(AtomicOrdering::Acquire);
-                continue;
-            }
-
-            match current.compare_exchange_weak(current_raw,
-                                                new_raw,
-                                                AtomicOrdering::AcqRel,
-                                                AtomicOrdering::Acquire) {
+        while now.elapsed().as_millis() < timeout {
+            match current.compare_exchange(current_raw,
+                                           new_raw,
+                                           AtomicOrdering::AcqRel,
+                                           AtomicOrdering::Acquire) {
                 Err(new_current_raw) => {
-                    if new_current_raw.is_null() {
-                        //替换失败，其它操作正在借用指定根节点的共享引用，则自旋后再次获取当前根节点，并重试
-                        spin(retry);
-                        current_raw = current.load(AtomicOrdering::Acquire);
-                        continue;
-                    } else {
-                        //替换失败，其它操作已经更新了根节点，则自旋后重试
-                        current_raw = new_current_raw;
-                        spin(retry);
-                        continue;
-                    }
+                    //替换失败，其它操作已经更新了根节点，则自旋后重试
+                    spin(retry);
+                    current_raw = new_current_raw;
+                    continue;
                 },
                 Ok(old_raw) => {
                     //替换成功
-                    let old_shared_root = unsafe { Arc::from_raw(old_raw as *mut Node<K, V>) };
+                    let old_shared_root = unsafe { Arc::from_raw(old_raw) };
                     return Some(old_shared_root);
                 },
             }
@@ -435,23 +687,23 @@ fn safety_replace_root<K, V>(current: &AtomicPtr<Node<K, V>>,
     } else {
         //未指定替换重试的超时时长，则不重试
         if current_raw.is_null() {
-            //替换失败，其它操作正在借用当产胆根节点的共享引用，则立即返回
+            //替换失败，其它操作正在借用当前根节点的共享引用，则立即返回
             spin(retry);
             current_raw = current.load(AtomicOrdering::Acquire);
             return None;
         }
 
-        match current.compare_exchange_weak(current_raw,
-                                            new_raw,
-                                            AtomicOrdering::AcqRel,
-                                            AtomicOrdering::Acquire) {
+        match current.compare_exchange(current_raw,
+                                       new_raw,
+                                       AtomicOrdering::AcqRel,
+                                       AtomicOrdering::Acquire) {
             Err(_) => {
                 //替换失败，其它操作已经更新了根节点，则立即返回
                 None
             },
             Ok(old_raw) => {
                 //替换成功
-                let old_shared_root = unsafe { Arc::from_raw(old_raw as *mut Node<K, V>) };
+                let old_shared_root = unsafe { Arc::from_raw(old_raw) };
                 Some(old_shared_root)
             },
         }
@@ -459,6 +711,7 @@ fn safety_replace_root<K, V>(current: &AtomicPtr<Node<K, V>>,
 }
 
 // 安全的更新写操作完成后的树，成功则返回旧的根节点，超时则返回空
+// 并发插入，更新或删除时会并发的替换当前根节点的共享引用，有可能出现冲突，可以设置合适的超时时间来避让冲突
 fn safety_modify_tree<K, V>(tree: &CowBtreeMap<K, V>,
                             (new_depth, new_root): (usize, Arc<Node<K, V>>),
                             timeout: Option<u128>) -> Option<Arc<Node<K, V>>>
@@ -485,10 +738,11 @@ fn query<'a: 'b, 'b, K, V>(mut node: &'a Node<K, V>,
     let mut is_next_child = true; //当前节点是否是上级非叶节点的后继子节点
 
     if writable {
-        //写操作的查询
+        //独占操作的查询
         loop {
             //复制当前节点，并关联复制的节点与上级非叶节点
             let node_copy = node.copy_on_write(); //为后续的写操作复制节点
+
             match stack.last_mut() {
                 None => {
                     //当前节点是根节点，则忽略修改复制的上级非叶节点中的子节点
@@ -514,6 +768,7 @@ fn query<'a: 'b, 'b, K, V>(mut node: &'a Node<K, V>,
             let r = if node.is_leaf() {
                 //叶节点，则查询指定关键字的值
                 stack.push((node_copy, 0)); //将当前叶节点的上级非叶节点复制和当前节点在上级非叶节点的键子对列表中的位置加入查询栈
+                drop(writable); //避免无法释放
                 return query_leaf(node.as_leaf().unwrap(), key);
             } else {
                 //非叶节点，则获取下一个子节点，并继续查询
@@ -526,13 +781,14 @@ fn query<'a: 'b, 'b, K, V>(mut node: &'a Node<K, V>,
             stack.push((node_copy, child_index)); //将当前节点的上级非叶节点复制和当前节点在上级非叶节点的键子对列表中的位置加入查询栈
         }
     } else {
-        //读操作的查询
+        //共享操作的查询
         loop {
             let node_copy = node.clone(); //为后续的读操作复制节点的共享引用
 
             child_index = if node.is_leaf() {
                 //叶节点，则查询指定关键字的值
                 stack.push((node_copy, 0)); //将当前叶节点的上级非叶节点复制和当前节点在上级非叶节点的键子对列表中的位置加入查询栈
+                drop(writable); //避免无法释放
                 return query_leaf(node.as_leaf().unwrap(), key);
             } else {
                 //非叶节点，则获取下一个子节点，并继续查询
@@ -1397,10 +1653,17 @@ struct InnerCowBtreeMap<
     K: Ord + Debug + Clone + Send + 'static,
     V: Debug + Clone + Send + 'static,
 > {
-    b:      usize,                  //块系数
-    length: AtomicU64,              //键值对数量
-    depth:  AtomicUsize,            //树深度
-    root:   AtomicPtr<Node<K, V>>,  //根节点
+    b:                              usize,                          //块系数
+    length:                         AtomicU64,                      //键值对数量
+    depth:                          AtomicUsize,                    //树深度
+    write_lock:                     AtomicBool,                     //写锁
+    root:                           AtomicPtr<Node<K, V>>,          //根节点
+    auto_collecting_threshold:      AtomicUsize,                    //自动整理的阈值
+    previous_generations_sender:    Sender<Arc<Node<K, V>>>,        //根节点的旧世代发送器
+    previous_generations_receiver:  Receiver<Arc<Node<K, V>>>,      //根节点的旧世代接收器
+    swap_generations_sender:        Sender<Arc<Node<K, V>>>,        //根节点的旧世代临时缓冲区发送器
+    swap_generations_receiver:      Receiver<Arc<Node<K, V>>>,      //根节点的旧世代临时缓冲区接收器
+    recyclable:                     Mutex<Vec<Arc<Node<K, V>>>>,    //可回收旧世代根节点列表
 }
 
 impl<
@@ -3134,12 +3397,23 @@ impl<
     }
 
     /// 提交对树的所有修改，提交超时则返回自身
+    /// 手动提交不会执行自动整理
     pub fn commit(self, timeout: Option<u128>) -> Result<(), Self> {
-        if let None = safety_modify_tree(&self.tree,
-                                         (self.new_depth.clone(), self.new_root.clone()),
-                                         timeout) {
-            //提交超时
-            return Err(self);
+        match safety_modify_tree(&self.tree,
+                                 (self.new_depth.clone(), self.new_root.clone()),
+                                 timeout) {
+            None => {
+                //提交超时
+                return Err(self);
+            },
+            Some(old_root) => {
+                self
+                    .tree
+                    .0
+                    .previous_generations_sender
+                    .send(old_root)
+                    .expect("Manual commit cow b plus tree failed");
+            },
         }
 
         //提交成功

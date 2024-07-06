@@ -39,6 +39,7 @@ pi_hash = "0.1"
 crc32fast = "~1.4"
 fastcmp = "1.0"
 num_cpus = "1.16"
+quanta = "0.12"
 pi_assets = { version = "0.13", path = "../pi_assets" }
 pi_share = "0.4"
 lzzzz = "~1.0"
@@ -49,5 +50,5 @@ env_logger = "0.9"
 rand = { version = "0.8", features = ["small_rng"] }
 persy = "1.1"
 lz4 = "~1.25"
-
+redb = "~2.1"
 
