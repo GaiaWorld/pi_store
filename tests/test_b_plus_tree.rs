@@ -1,9 +1,203 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::{SeedableRng, seq::SliceRandom, rngs::SmallRng};
 
 use pi_store::free_lock::b_plus_tree::{CowBtreeMap, KeyIterator, KVPairIterator};
+
+use redb::{ReadableTable, Builder, StorageBackend, TableDefinition, Table, ReadOnlyTable, Durability};
+
+#[test]
+fn test_redb_delay_commit() {
+    //初始化数据库，并清空表
+    let now = Instant::now();
+    let mut db = Builder::new()
+        .set_cache_size(16 * 1024 * 1024)
+        .create("./redb/db.dat")
+        .unwrap();
+    println!("======> load db finish, time: {:?}", now.elapsed());
+
+    //测试延迟提交，被事务打开的表必须全部关闭后，事务提交或关闭时才会完整释放
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::None); //采用非持久化的提交
+    for index in 0..100000 {
+        let mut table: Table<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        let _ = table.insert(index, index).unwrap();
+    }
+    tr.commit().unwrap();
+    println!("======> write finish, time: {:?}", now.elapsed());
+
+    //验证上一个写事务是否已提交，被事务打开的表必须全部关闭后，事务提交或关闭时才会完整释放
+    let now = Instant::now();
+    let tr = db.begin_read().unwrap();
+    {
+        let table: ReadOnlyTable<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        for index in 0..100000 {
+            if let Ok(Some(val)) = table.get(index) {
+                let value = val.value();
+                if value != index {
+                    panic!("!!!!!!> read failed, index: {:?}, value: {:?}, reason: value not match", index, value);
+                }
+            } else {
+                panic!("!!!!!!> read failed, index: {:?}, reason: invalid last write tranasaction", index);
+            }
+        }
+    }
+    tr.close();
+    println!("======> read finish, time: {:?}", now.elapsed());
+
+    //延迟持久化的提交
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::Immediate);
+    tr.commit().unwrap();
+    println!("======> durability commit finish, time: {:?}", now.elapsed());
+
+    //重新启动数据库，验证数据是否已持久化，有任何未关闭的事务时，数据库将无法关闭并释放
+    drop(db);
+    let now = Instant::now();
+    let mut db = Builder::new()
+        .set_cache_size(16 * 1024 * 1024)
+        .create("./redb/db.dat")
+        .unwrap();
+    println!("======> reload db finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let tr = db.begin_read().unwrap();
+    {
+        let table: ReadOnlyTable<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        for index in 0..100000 {
+            //验证上一个数据库实例的写事务是否已持久化，被事务打开的表必须全部关闭后，事务提交或关闭时才会完整释放
+            if let Ok(Some(val)) = table.get(index) {
+                let value = val.value();
+                if value != index {
+                    panic!("!!!!!!> check failed, index: {:?}, value: {:?}, reason: value not match", index, value);
+                }
+            } else {
+                panic!("!!!!!!> check failed, index: {:?}, reason: invalid last write tranasaction", index);
+            }
+        }
+    }
+    tr.close();
+    println!("======> check finish, time: {:?}", now.elapsed());
+
+    //压缩数据库，没有任何已打开事务时压缩才会成功
+    let now = Instant::now();
+    let _ = db.compact().unwrap();
+    println!("======> compact db finish, time: {:?}", now.elapsed());
+}
+
+#[test]
+fn test_redb_savepoint() {
+    //初始化数据库，并清空表
+    let now = Instant::now();
+    let mut db = Builder::new()
+        .set_cache_size(16 * 1024 * 1024)
+        .create("./redb/db.dat")
+        .unwrap();
+    println!("======> load db finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::None); //采用非持久化的提交
+    for index in 0..100000 {
+        let mut table: Table<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        let _ = table.insert(index, index).unwrap();
+    }
+    tr.commit().unwrap();
+    println!("======> write finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::Immediate);
+    tr.commit().unwrap();
+    println!("======> durability commit finish, time: {:?}", now.elapsed());
+
+    //执行持久化快照，有任何未关闭的写事务，数据库将无法快照
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap(); //默认Durability::Immediate
+    let savepoint0 = tr.persistent_savepoint().unwrap();
+    tr.commit().unwrap();
+    println!("======> save finish, savepoint: {:?}, time: {:?}", savepoint0, now.elapsed());
+
+    //重新启动数据库，有任何未关闭的事务时，数据库将无法关闭并释放
+    drop(db);
+    let now = Instant::now();
+    let mut db = Builder::new()
+        .set_cache_size(16 * 1024 * 1024)
+        .create("./redb/db.dat")
+        .unwrap();
+    println!("======> reload db finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::None); //采用非持久化的提交
+    for index in 100000..200000 {
+        let mut table: Table<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        let _ = table.insert(index, index).unwrap();
+    }
+    tr.commit().unwrap();
+    println!("======> write finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    tr.set_durability(Durability::Immediate);
+    tr.commit().unwrap();
+    println!("======> durability commit finish, time: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap(); //默认Durability::Immediate
+    let savepoint1 = tr.persistent_savepoint().unwrap();
+    tr.commit().unwrap();
+    println!("======> save other finish, savepoint: {:?}, time: {:?}", savepoint1, now.elapsed());
+
+    //切换快照，有任何未关闭的事务时，数据库将无法切换快照
+    //注：切换到旧快照的数据库后，将不包括最近的快照
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    let mut savepoints = tr.list_persistent_savepoints().unwrap();
+    while let Some(savepoint) = savepoints.next() {
+        println!("======> exist savepoint, {:?}", savepoint);
+    }
+    let savepoint = tr.get_persistent_savepoint(savepoint0).unwrap();
+    tr.restore_savepoint(&savepoint).unwrap();
+    tr.commit().unwrap();
+    println!("======> restore finish, savepoint: {:?}, time: {:?}", savepoint0, now.elapsed());
+
+    //验证切换的快照，被事务打开的表必须全部关闭后，事务提交或关闭时才会完整释放
+    let now = Instant::now();
+    let tr = db.begin_read().unwrap();
+    {
+        let table: ReadOnlyTable<u32, u32> = tr.open_table(TableDefinition::new("test001")).unwrap();
+        for index in 0..100000 {
+            if let Ok(Some(val)) = table.get(index) {
+                let value = val.value();
+                assert_eq!(value, index);
+            } else {
+                panic!("!!!!!!> read failed, index: {:?}, reason: invalid last write tranasaction", index);
+            }
+        }
+        assert!(table.get(100000).ok().unwrap().is_none());
+    }
+    tr.close();
+    println!("======> read finish, time: {:?}", now.elapsed());
+
+    //删除所有快照
+    let now = Instant::now();
+    let mut tr = db.begin_write().unwrap();
+    let mut savepoints = tr.list_persistent_savepoints().unwrap();
+    while let Some(savepoint) = savepoints.next() {
+        let _ = tr.delete_persistent_savepoint(savepoint).unwrap();
+    }
+    tr.commit().unwrap();
+    println!("======> delete savepoint finish, time: {:?}", now.elapsed());
+
+    //压缩数据库，没有任何已打开事务时压缩才会成功
+    let now = Instant::now();
+    let _ = db.compact().unwrap();
+    println!("======> compact db finish, time: {:?}", now.elapsed());
+}
 
 #[test]
 fn test_create_tree() {
