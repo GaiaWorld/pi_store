@@ -1403,7 +1403,7 @@ fn create_log_file_name(width: usize, id: usize) -> String {
 
 //将日志文件名转换为数字
 #[inline]
-fn log_file_name_to_usize(name: &str) -> Option<usize> {
+pub(crate) fn log_file_name_to_usize(name: &str) -> Option<usize> {
     let vec: Vec<&str> = name.split('.').collect();
     if let Ok(n) = vec[0].parse() {
         return Some(n);

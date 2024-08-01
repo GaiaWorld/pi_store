@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc,
                 atomic::{AtomicBool, AtomicU64, Ordering}};
-
+use std::sync::atomic::AtomicUsize;
 use futures::future::{FutureExt, BoxFuture};
 use async_lock::Mutex;
 use bytes::BufMut;
@@ -16,7 +16,7 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::AsyncCommitLog;
 
-use crate::log_store::log_file::{PairLoader, LogMethod, LogFile};
+use crate::log_store::log_file::{PairLoader, LogMethod, LogFile, log_file_name_to_usize};
 
 ///
 /// 默认的提交日志的文件大小，为了防止自动生成新的可写文件，所以默认为最大
@@ -137,6 +137,8 @@ impl CommitLoggerBuilder {
         let is_replaying = AtomicBool::new(false); //默认没有重播
         let replay_only_reads = SpinLock::new(VecDeque::new());
         let replay_confirm_buf = SpinLock::new(VecDeque::new());
+        let commit_log_count = AtomicUsize::new(0);
+        let confirm_commited_count = AtomicUsize::new(0);
 
         let inner = InnerCommitLogger {
             rt: rt.clone(),
@@ -150,6 +152,8 @@ impl CommitLoggerBuilder {
             is_replaying,
             replay_only_reads,
             replay_confirm_buf,
+            commit_log_count,
+            confirm_commited_count,
         };
         let commit_logger = CommitLogger(Arc::new(inner));
 
@@ -198,6 +202,8 @@ impl AsyncCommitLog for CommitLogger {
 
             //增加已写入当前可写文件的字节数量
             logger.0.writed_size.fetch_add(log.as_ref().len() as u64 + 16, Ordering::Relaxed);
+            //增加提交日志的数量
+            logger.0.commit_log_count.fetch_add(1, Ordering::Relaxed);
 
             //注册本次事务到检查点表
             let (counter, path) = &*logger.0.writable.lock();
@@ -238,6 +244,8 @@ impl AsyncCommitLog for CommitLogger {
 
             if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
                 //从检查点表中移除已确认的事务，并减少事务对应检查点的计数
+                logger.0.confirm_commited_count.fetch_add(1, Ordering::Relaxed); //增加确认提交的数量
+
                 if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
                     //当前已确认事务对应的检查点的计数已清空，则表示事务对应检查点的所有事务已完成确认
                     if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
@@ -400,6 +408,9 @@ impl AsyncCommitLog for CommitLogger {
             counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
             check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
 
+            //增加提交日志的数量
+            logger.0.commit_log_count.fetch_add(1, Ordering::Relaxed);
+
             Ok(0)
         }.boxed()
     }
@@ -438,7 +449,26 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
-    /// 获取当前检查点
+    fn check_point_of(&self, commit_uid: Self::Cid) -> BoxFuture<'static, Option<usize>> {
+        let logger = self.clone();
+
+        async move {
+            let check_point_path = if let Some((_counter, check_point_path)) = logger.0.check_points.lock().await.get(&commit_uid) {
+                check_point_path.as_ref().clone()
+            } else {
+                return None;
+            };
+
+            if let Some(file_name) = check_point_path.file_name() {
+                if let Some(file_name_str) = file_name.to_str() {
+                    return log_file_name_to_usize(file_name_str);
+                }
+            }
+
+            None
+        }.boxed()
+    }
+
     fn current_check_point(&self) -> BoxFuture<'static, usize> {
         let logger = self.clone();
 
@@ -458,6 +488,33 @@ impl AsyncCommitLog for CommitLogger {
             let _check_pointes_locked = logger.0.check_points.lock().await;
             new_check_point(&logger, false).await
         }.boxed()
+    }
+
+    fn waiting_confirm_count(&self) -> BoxFuture<'static, usize> {
+        let logger = self.clone();
+
+        async move {
+            logger
+                .0
+                .check_points
+                .lock()
+                .await
+                .len()
+        }.boxed()
+    }
+
+    fn append_total_count(&self) -> usize {
+        self
+            .0
+            .commit_log_count
+            .load(Ordering::Relaxed)
+    }
+
+    fn confirm_total_count(&self) -> usize {
+        self
+            .0
+            .confirm_commited_count
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -507,17 +564,19 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
 
 // 基于日志文件的内部提交日志记录器
 struct InnerCommitLogger {
-    rt:                 MultiTaskRuntime<()>,                                   //异步运行时
-    file:               LogFile,                                                //日志文件
-    delay_timeout:      usize,                                                  //延迟刷新提交日志的时间，单位毫秒
-    log_file_limit:     u64,                                                    //日志文件的可写文件的最大限制
-    writed_size:        AtomicU64,                                              //已写入当前可写文件的字节数量
-    writable:           SpinLock<(Arc<AtomicU64>, Arc<PathBuf>)>,               //提交日志记录器的可写检查点
-    only_reads:         SpinLock<VecDeque<(PathBuf, bool)>>,                    //提交日志记录器的只读检查点的文件路径列表
-    check_points:       Mutex<XHashMap<Guid, (Arc<AtomicU64>, Arc<PathBuf>)>>,  //提交日志记录器的检查点表
-    is_replaying:       AtomicBool,                                             //是否正在重播
-    replay_only_reads:  SpinLock<VecDeque<PathBuf>>,                            //需要重播的提交日志的只读日志文件路径列表
-    replay_confirm_buf: SpinLock<VecDeque<Guid>>,                               //已确认的重播事务的提交唯一id缓冲区
+    rt:                     MultiTaskRuntime<()>,                                   //异步运行时
+    file:                   LogFile,                                                //日志文件
+    delay_timeout:          usize,                                                  //延迟刷新提交日志的时间，单位毫秒
+    log_file_limit:         u64,                                                    //日志文件的可写文件的最大限制
+    writed_size:            AtomicU64,                                              //已写入当前可写文件的字节数量
+    writable:               SpinLock<(Arc<AtomicU64>, Arc<PathBuf>)>,               //提交日志记录器的可写检查点
+    only_reads:             SpinLock<VecDeque<(PathBuf, bool)>>,                    //提交日志记录器的只读检查点的文件路径列表
+    check_points:           Mutex<XHashMap<Guid, (Arc<AtomicU64>, Arc<PathBuf>)>>,  //提交日志记录器的检查点表
+    is_replaying:           AtomicBool,                                             //是否正在重播
+    replay_only_reads:      SpinLock<VecDeque<PathBuf>>,                            //需要重播的提交日志的只读日志文件路径列表
+    replay_confirm_buf:     SpinLock<VecDeque<Guid>>,                               //已确认的重播事务的提交唯一id缓冲区
+    commit_log_count:       AtomicUsize,                                            //提交日志的数量
+    confirm_commited_count: AtomicUsize,                                            //确认提交的数量
 }
 
 // 提交日志加载器
