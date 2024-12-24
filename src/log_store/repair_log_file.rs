@@ -229,6 +229,7 @@ async fn load_file(
         ));
     }
     // 块记录
+    let mut eof = false;
     let mut blocks: Vec<(u64, u64)> = Vec::new();
     loop {
         match read_log_file(file_path.clone(), file.clone(), offset, len).await {
@@ -252,6 +253,25 @@ async fn load_file(
                             //已读到日志文件头，则立即返回
                             break;
                         } else {
+                            if !eof
+                                && file_offset == 0
+                                && next_file_offset == 0 {
+                                //已读到当前日志文件头
+                                eof = true;
+                            } else if eof
+                                && file_offset == 0
+                                && next_file_offset == 0
+                                && next_len > std::cmp::max(file_offset, len) {
+                                //重复读取到当前日志文件头，则日志文件已损坏，立即返回错误原因
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Read log file block failed, path: {:?}, file offset: {:?}, buf len: {:?}, next offset: {:?}, next len: {:?}, reason: invalid next len",
+                                                              file_path,
+                                                              file_offset,
+                                                              len,
+                                                              next_file_offset,
+                                                              next_len)));
+                            }
+
                             //更新日志文件位置
                             offset = Some(next_file_offset);
                             len = next_len;
