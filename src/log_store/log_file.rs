@@ -1520,6 +1520,7 @@ async fn load_file<C: PairLoader>(log_file: &LogFile,
         }
     };
 
+    let mut eof = false;
     loop {
         match read_log_file(file_path.clone(),
                             file.clone(),
@@ -1547,10 +1548,29 @@ async fn load_file<C: PairLoader>(log_file: &LogFile,
                         }
 
                         if next_file_offset == 0 && next_len == 0 {
-                            //已读到日志文件头，则立即返回
+                            //加载当前日志文件已完成，则立即返回
                             break;
                         } else {
-                            //更新日志文件位置
+                            if !eof
+                                && file_offset == 0
+                                && next_file_offset == 0 {
+                                //已读到当前日志文件头
+                                eof = true;
+                            } else if eof
+                                && file_offset == 0
+                                && next_file_offset == 0
+                                && next_len > std::cmp::max(file_offset, len) {
+                                //重复读取到当前日志文件头，则日志文件已损坏，立即返回错误原因
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Read log file block failed, path: {:?}, file offset: {:?}, buf len: {:?}, next offset: {:?}, next len: {:?}, reason: invalid next len",
+                                                              file_path,
+                                                              file_offset,
+                                                              len,
+                                                              next_file_offset,
+                                                              next_len)));
+                            }
+
+                            //更新日志文件位置，并继续往前读
                             offset = Some(next_file_offset);
                             len = next_len;
                         }
@@ -1611,7 +1631,11 @@ pub fn read_log_file_block(file_path: PathBuf,
                            file_offset: u64,
                            read_len: u64,
                            is_checksum: bool) -> Result<(u64, u64, LinkedList<(LogMethod, Vec<u8>, Option<Vec<u8>>)>)> {
-    debug!("=====>file_path: {:?}, bin len: {}, file_offset: {}, read_len: {}", file_path, bin.len(), file_offset, read_len);
+    debug!("=====>file_path: {:?}, bin len: {}, file_offset: {}, read_len: {}",
+        file_path,
+        bin.len(),
+        file_offset,
+        read_len);
     let mut result = LinkedList::new();
     if bin.len() == 0 {
         //缓冲区长度为0，则立即退出
@@ -1640,7 +1664,12 @@ pub fn read_log_file_block(file_path: PathBuf,
                                                    payload_len,
                                                    is_checksum) {
                     //校验日志块负载失败，则立即返回错误
-                    return Err(Error::new(ErrorKind::Other, format!("Valid failed for read log block, path: {:?}, file offset: {:?}, header offset: {:?}, reason: {:?}", file_path, file_offset, header_offset, e)));
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Valid failed for read log block, path: {:?}, file offset: {:?}, header offset: {:?}, reason: {:?}",
+                                                  file_path,
+                                                  file_offset,
+                                                  header_offset,
+                                                  e)));
                 }
 
                 bin_top -= payload_len as u64; //读日志块负载成功，从缓冲区的剩余长度中减去日志块负载长度
