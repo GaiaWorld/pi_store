@@ -354,6 +354,8 @@ fn test_log_files() {
 
 #[test]
 fn test_log_load() {
+    env_logger::init();
+
     let _handle = startup_global_time_loop(100);
     let builder = MultiTaskRuntimeBuilder::default();
     let rt = builder.build();
