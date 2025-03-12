@@ -35,7 +35,7 @@ pi_share = "0.5"
 lzzzz = "~1.0"
 
 [dev-dependencies]
-pi_blocks_allocator = { version = "0.2", path = "../pi_blocks_allocator", registry = "yn" }
+pi_blocks_allocator = { version = "0.2", path = "../pi_blocks_allocator" }
 env_logger = "0.9"
 rand = { version = "0.8", features = ["small_rng"] }
 persy = "1.1"
