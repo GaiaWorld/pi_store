@@ -1338,20 +1338,23 @@ async fn commit_alloced<BU, BS, BK, BV, BD, BF>(table: &VirtualPageTable,
 
             if location.is_empty() {
                 //分配块失败，则立即抛出异常
-                panic!("Commit alloced failed, page_id: {:?}, device: {}, size: {:?}, reason: out of space");
+                panic!("Commit alloced failed, page_id: {:?}, offset: {:?}, size: {:?}, reason: out of space",
+                       page_id,
+                       offset,
+                       size);
             }
 
             //注册指定页id和块位置的虚拟页
             if let Some(_) = register_page(table, page_id.clone(), location.clone()) {
                 //不允许注册已存在的虚拟页
-                panic!("Commit alloced failed, page_id: {:?}, device: {}, size: {:?}, reason: conflict page",
+                panic!("Commit alloced failed, page_id: {:?}, offset: {:?}, size: {:?}, reason: conflict page",
                        page_id,
                        offset,
                        size);
             }
 
             //注册并分配虚拟页成功
-            debug!("Immediate Commit alloced ok, page_id: {:?}, device: {}, size: {:?}",
+            debug!("Immediate Commit alloced ok, page_id: {:?}, offset: {:?}, size: {:?}",
                 page_id,
                 offset,
                 size);
@@ -1367,7 +1370,10 @@ async fn commit_alloced<BU, BS, BK, BV, BD, BF>(table: &VirtualPageTable,
 
                 if location.is_empty() {
                     //分配块失败，则立即抛出异常
-                    panic!("Commit alloced failed, page_id: {:?}, device: {}, size: {:?}, reason: out of space");
+                    panic!("Commit alloced failed, page_id: {:?}, offset: {:?}, size: {:?}, reason: out of space",
+                           page_id,
+                           offset,
+                           size);
                 }
 
                 //原子的更新指定页id对应的块位置
