@@ -175,7 +175,30 @@ pub trait PairLoader {
     fn is_require(&self, log_file: Option<&PathBuf>, key: &Vec<u8>) -> bool;
 
     //加载指定键值对，值为None表示此关键字的键值对已被移除
-    fn load(&mut self, log_file: Option<&PathBuf>, method: LogMethod, key: Vec<u8>, value: Option<Vec<u8>>);
+    fn load(&mut self,
+            log_file: Option<&PathBuf>,
+            method: LogMethod,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>);
+}
+
+/*
+* 扩展的键值对加载器
+*/
+pub trait PairLoaderExt {
+    /// 判断是否需要加载关键字的键值对
+    fn is_require(&self,
+                  log_file: Option<&PathBuf>,
+                  payload_time: u64,
+                  key: &Vec<u8>) -> bool;
+
+    /// 加载指定键值对，值为None表示此关键字的键值对已被移除
+    fn load(&mut self,
+            log_file: Option<&PathBuf>,
+            method: LogMethod,
+            payload_time: u64,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>);
 }
 
 /*
@@ -639,6 +662,77 @@ impl LogFile {
                                   offset,
                                   buf_len,
                                   is_checksum).await {
+            //读可写日志文件的指定二进制块失败，则立即返回错误
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    //从前往后加载日志文件的内容到指定缓存，
+    //可以指定从只读日志文件开始往后加载，不指定则从第一个只读日志文件开始往后加载
+    //注意日志文件内还是从文件尾开始往前加载日志块
+    pub async fn load_before_with_payload_time<C: PairLoaderExt>(&self,
+                                                                 cache: &mut C,
+                                                                 path: Option<PathBuf>,
+                                                                 buf_len: u64,
+                                                                 is_checksum: bool) -> Result<()> {
+        let log_index = unsafe { get_log_index_before(path.as_ref(), &*self.0.readable.load(Ordering::Relaxed)) };
+        let offset = None;
+
+        if log_index.is_none() {
+            //只需要加载可写日志文件，则忽略其它只读日志文件的加载，并立即结束本次加载
+            if let Err(e) = load_file_with_payload_time(self,
+                                                        cache,
+                                                        None,
+                                                        offset,
+                                                        buf_len,
+                                                        is_checksum).await {
+                //读可写日志文件的指定二进制块失败，则立即返回错误
+                return Err(e);
+            }
+
+            return Ok(());
+        }
+
+        //从指定只读日志文件开始，往后加载只读日志文件
+        let readable_box = unsafe { Box::from_raw(self.0.readable.load(Ordering::Relaxed)) };
+        let len = (&*readable_box).len();
+        Box::into_raw(readable_box); //避免被提前释放
+
+        let mut indexes = Vec::new();
+        if let Some(mut i) = log_index {
+            if i >= len {
+                //当序号大于等于只读日志文件数量，则加载所有只读日志文件
+                for index in 0..len {
+                    indexes.push(index);
+                }
+            } else {
+                //否则从指定的只读日志文件开始往后加载其它的只读日志文件
+                for index in i..len {
+                    indexes.push(index);
+                }
+            }
+        }
+
+        for index in indexes {
+            if let Err(e) = load_file_with_payload_time(self,
+                                                        cache,
+                                                        Some(index),
+                                                        offset,
+                                                        buf_len, is_checksum).await {
+                //加载指定日志文件的指定二进制块失败，则立即返回错误
+                return Err(e);
+            }
+        }
+
+        //最后加载可写日志文件的内容
+        if let Err(e) = load_file_with_payload_time(self,
+                                                    cache,
+                                                    None,
+                                                    offset,
+                                                    buf_len,
+                                                    is_checksum).await {
             //读可写日志文件的指定二进制块失败，则立即返回错误
             return Err(e);
         }
@@ -1583,6 +1677,112 @@ async fn load_file<C: PairLoader>(log_file: &LogFile,
     Ok(())
 }
 
+//加载指定日志文件的日志块，包括块同步时间，从后到前的加载，则合并相同关键字的日志，从前向后的加载，则不需要合并相同关键字的日志
+async fn load_file_with_payload_time<C: PairLoaderExt>(log_file: &LogFile,
+                                                       cache: &mut C,
+                                                       log_index: Option<usize>,
+                                                       mut offset: Option<u64>,
+                                                       mut len: u64,
+                                                       is_checksum: bool) -> Result<()> {
+    if len < DEFAULT_LOG_BLOCK_HEADER_LEN as u64 {
+        return Err(Error::new(ErrorKind::Other, format!("Load file failed, log index: {:?}, offset: {:?}, len: {:?}, checksum: {:?}, reason: {:?}", log_index, offset, len, is_checksum, "Invalid len")));
+    }
+
+    let (file_path, file) = if let Some(log_index) = log_index {
+        //读取指定的只读日志文件
+        unsafe {
+            let readable = Box::from_raw(log_file.0.readable.load(Ordering::Relaxed));
+            let readable_path = (&*readable).get(log_index).unwrap().clone();
+            Box::into_raw(readable); //避免被回收
+
+            match AsyncFile::open(log_file.0.rt.clone(), readable_path.clone(), AsyncFileOptions::OnlyRead).await {
+                Err(e) => {
+                    //打开指定的只读日志文件失败，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other, format!("Load log file failed, file: {:?}, reason: {:?}", readable_path, e)));
+                },
+                Ok(readable_file) => {
+                    //打开指定的只读日志文件成功
+                    (readable_path, readable_file)
+                },
+            }
+        }
+    } else {
+        //读取当前可写日志文件的路径和文件句柄
+        unsafe {
+            let writable = Box::from_raw(log_file.0.writable.load(Ordering::Relaxed));
+            let r = (&*writable).as_ref().unwrap().clone();
+            Box::into_raw(writable); //避免被回收
+            r
+        }
+    };
+
+    let mut eof = false;
+    loop {
+        match read_log_file(file_path.clone(),
+                            file.clone(),
+                            offset,
+                            len).await {
+            Err(e) => return Err(e),
+            Ok((file_offset, bin)) => {
+                match read_log_file_block_with_payload_time(file_path.clone(),
+                                                            &bin,
+                                                            file_offset,
+                                                            len,
+                                                            is_checksum) {
+                    Err(e) => return Err(e),
+                    Ok((next_file_offset, next_len, logs)) => {
+                        //读日志文件的指定缓冲区成功
+                        let log_index_file = unsafe { get_log_path(log_index,
+                                                                   &*log_file.0.writable.load(Ordering::Relaxed),
+                                                                   &*log_file.0.readable.load(Ordering::Relaxed)) };
+
+                        for (method, payload_time, key, value) in logs {
+                            if cache.is_require(log_index_file.as_ref(), payload_time, &key) {
+                                //需要加入缓存
+                                cache.load(log_index_file.as_ref(),
+                                           method,
+                                           payload_time,
+                                           key,
+                                           value);
+                            }
+                        }
+
+                        if next_file_offset == 0 && next_len == 0 {
+                            //加载当前日志文件已完成，则立即返回
+                            break;
+                        } else {
+                            if !eof
+                                && file_offset == 0
+                                && next_file_offset == 0 {
+                                //已读到当前日志文件头
+                                eof = true;
+                            } else if eof
+                                && file_offset == 0
+                                && next_file_offset == 0
+                                && next_len > std::cmp::max(file_offset, len) {
+                                //重复读取到当前日志文件头，则日志文件已损坏，立即返回错误原因
+                                return Err(Error::new(ErrorKind::Other,
+                                                      format!("Read log file block failed, path: {:?}, file offset: {:?}, buf len: {:?}, next offset: {:?}, next len: {:?}, reason: invalid next len",
+                                                              file_path,
+                                                              file_offset,
+                                                              len,
+                                                              next_file_offset,
+                                                              next_len)));
+                            }
+
+                            //更新日志文件位置，并继续往前读
+                            offset = Some(next_file_offset);
+                            len = next_len;
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
 //从指定日志文件的指定位置开始，倒着读取二进制数据，返回本次获取数据时的偏移和本次获取的数据，如果返回偏移为0则表示指定日志文件已读到头
 pub async fn read_log_file(file_path: PathBuf,
                            file: AsyncFile<()>,
@@ -1630,7 +1830,9 @@ pub fn read_log_file_block(file_path: PathBuf,
                            bin: &Vec<u8>,
                            file_offset: u64,
                            read_len: u64,
-                           is_checksum: bool) -> Result<(u64, u64, LinkedList<(LogMethod, Vec<u8>, Option<Vec<u8>>)>)> {
+                           is_checksum: bool)
+    -> Result<(u64, u64, LinkedList<(LogMethod, Vec<u8>, Option<Vec<u8>>)>)>
+{
     debug!("=====>file_path: {:?}, bin len: {}, file_offset: {}, read_len: {}",
         file_path,
         bin.len(),
@@ -1663,6 +1865,79 @@ pub fn read_log_file_block(file_path: PathBuf,
                                                    payload_checksum,
                                                    payload_len,
                                                    is_checksum) {
+                    //校验日志块负载失败，则立即返回错误
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Valid failed for read log block, path: {:?}, file offset: {:?}, header offset: {:?}, reason: {:?}",
+                                                  file_path,
+                                                  file_offset,
+                                                  header_offset,
+                                                  e)));
+                }
+
+                bin_top -= payload_len as u64; //读日志块负载成功，从缓冲区的剩余长度中减去日志块负载长度
+
+                debug!("=====>file_offset: {}, bin_top: {}", file_offset, bin_top);
+                if file_offset == 0 && bin_top == 0 {
+                    //已读取当前日志文件的所有日志块，则立即退出
+                    return Ok((0, 0, result));
+                }
+            },
+        }
+    }
+
+    //返回下次需要读取的日志文件偏移和这次从所有的完整日志块中读取的日志
+    let unread_len = file_offset + bin_top; //获取文件剩余未读长度和缓冲区未读长度
+    let next_file_offset = unread_len.checked_sub(read_len).unwrap_or(0);
+    let next_read_len = if unread_len < read_len {
+        //文件剩余未读长度小于当前读取长度
+        unread_len
+    } else {
+        //文件剩余未读长度大于等于当前读取长度
+        read_len
+    };
+    Ok((next_file_offset, next_read_len, result))
+}
+
+//从指定缓冲区的指定位置开始，读取二进制块，返回下次需要读取的日志文件偏移和日志，需要读取的日志文件偏移为0，则表示指定日志文件的指定位置没有二进制块
+pub fn read_log_file_block_with_payload_time(file_path: PathBuf,
+                                             bin: &Vec<u8>,
+                                             file_offset: u64,
+                                             read_len: u64,
+                                             is_checksum: bool)
+    -> Result<(u64, u64, LinkedList<(LogMethod, u64, Vec<u8>, Option<Vec<u8>>)>)>
+{
+    debug!("=====>file_path: {:?}, bin len: {}, file_offset: {}, read_len: {}",
+        file_path,
+        bin.len(),
+        file_offset,
+        read_len);
+    let mut result = LinkedList::new();
+    if bin.len() == 0 {
+        //缓冲区长度为0，则立即退出
+        return Ok((0, 0, result));
+    }
+
+    //从缓冲区中读取所有完整的日志块，默认情况下缓冲区长度至少等于日志块头的长度
+    let header_len = DEFAULT_LOG_BLOCK_HEADER_LEN as u64; //日志块头的长度
+    let mut bin_top = bin.len() as u64; //初始化缓冲区的剩余长度
+    while bin_top >= header_len {
+        let header_offset = bin_top - header_len; //获取缓冲区的当前头偏移
+        match read_block_header(bin, file_offset, read_len, header_offset) {
+            (Some((next_file_offset, next_read_len)), _, _, _, _) => {
+                //读当前缓冲区中，当前二进制数据未包括完整的日志块负载，则立即返回需要读取的日志文件偏移和长度，以保证可以继续读日志块
+                return Ok((next_file_offset, next_read_len, result));
+            },
+            (None, payload_offset, payload_time, payload_checksum, payload_len) => {
+                //读日志块头成功
+                bin_top -= header_len; //从缓冲区的剩余长度中减去日志块头长度
+                if let Err(e) = read_block_payload_with_payload_time(&mut result,
+                                                                     &file_path,
+                                                                     bin,
+                                                                     payload_offset,
+                                                                     payload_time,
+                                                                     payload_checksum,
+                                                                     payload_len,
+                                                                     is_checksum) {
                     //校验日志块负载失败，则立即返回错误
                     return Err(Error::new(ErrorKind::Other,
                                           format!("Valid failed for read log block, path: {:?}, file offset: {:?}, header offset: {:?}, reason: {:?}",
@@ -1792,7 +2067,73 @@ fn read_block_payload<P: AsRef<Path>>(list: &mut LinkedList<(LogMethod, Vec<u8>,
         let hash = hasher.finalize();
         if payload_checksum != hash {
             //校验尾块负载失败，则立即返回错误
-            return Err(Error::new(ErrorKind::Other, format!("Read log block payload failed, path: {:?}, offset: {:?}, len: {:?}, checksum: {:?}, real: {:?}, reason: Valid checksum error", path.as_ref(), payload_offset, payload_len, payload_checksum, hash)));
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Read log block payload failed, path: {:?}, offset: {:?}, len: {:?}, checksum: {:?}, real: {:?}, reason: Valid checksum error",
+                                          path.as_ref(),
+                                          payload_offset,
+                                          payload_len,
+                                          payload_checksum,
+                                          hash)));
+        }
+    }
+    Ok(())
+}
+
+//读二进制块负载，包括块同步时间
+fn read_block_payload_with_payload_time<P: AsRef<Path>>(list: &mut LinkedList<(LogMethod, u64, Vec<u8>, Option<Vec<u8>>)>,
+                                                        path: P,
+                                                        bin: &Vec<u8>,
+                                                        payload_offset: u64,
+                                                        payload_time: u64,
+                                                        payload_checksum: u32,
+                                                        payload_len: u32,
+                                                        is_checksum: bool) -> Result<()> {
+    let bytes = &bin[payload_offset as usize..payload_offset as usize + payload_len as usize];
+    let mut hasher = Hasher::new();
+    let mut payload = Cursor::new(bytes).copy_to_bytes(bytes.len());
+    hasher.update(payload.as_ref());
+    hasher.update(&payload_time.to_le_bytes());
+
+    //将当前块的日志写入缓冲栈中
+    let mut stack = Vec::new();
+    while payload.len() > 0 {
+        //解析日志方法和关键字
+        let tag = LogMethod::with_tag(payload.get_u8());
+        let key_len = payload.get_u16_le() as usize;
+        let mut swap = payload.split_off(key_len);
+        let key = payload.to_vec();
+        payload = swap;
+
+        //解析值
+        if let LogMethod::Remove = tag {
+            //移除方法的日志，则忽略值解析，并继续解析下一个日志
+            stack.push((tag, payload_time, key, None));
+            continue;
+        }
+        let value_len = payload.get_u32_le() as usize;
+        swap = payload.split_off(value_len);
+        let value = payload.to_vec();
+        payload = swap;
+        stack.push((tag, payload_time, key, Some(value)));
+    }
+
+    //将日志从临时缓冲栈中弹出，并写入链表尾部
+    while let Some(log) = stack.pop() {
+        list.push_back(log);
+    }
+
+    if is_checksum {
+        //需要校验块负载
+        let hash = hasher.finalize();
+        if payload_checksum != hash {
+            //校验尾块负载失败，则立即返回错误
+            return Err(Error::new(ErrorKind::Other,
+                                  format!("Read log block payload failed, path: {:?}, offset: {:?}, len: {:?}, checksum: {:?}, real: {:?}, reason: Valid checksum error",
+                                          path.as_ref(),
+                                          payload_offset,
+                                          payload_len,
+                                          payload_checksum,
+                                          hash)));
         }
     }
     Ok(())

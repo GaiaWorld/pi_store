@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc,
-                atomic::{AtomicBool, AtomicU64, Ordering}};
-use std::sync::atomic::AtomicUsize;
+                atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+
 use futures::future::{FutureExt, BoxFuture};
 use async_lock::Mutex;
 use bytes::BufMut;
@@ -16,7 +16,7 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{AsyncRuntime, multi_thread::MultiTaskRuntime}};
 use pi_async_transaction::AsyncCommitLog;
 
-use crate::log_store::log_file::{PairLoader, LogMethod, LogFile, log_file_name_to_usize};
+use crate::log_store::log_file::{PairLoader, LogMethod, LogFile, log_file_name_to_usize, PairLoaderExt};
 
 ///
 /// 默认的提交日志的文件大小，为了防止自动生成新的可写文件，所以默认为最大
@@ -47,6 +47,17 @@ const DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT: u64 = 32 * 1024 * 1024;
 /// 默认的提交日志记录器的定时整理间隔时长，单位ms
 ///
 const DEFAULT_COMMIT_LOG_COLLECT_INTERVAL: usize = 10 * 1000;
+
+///
+/// 基于日志文件的提交日志记录器的扩展
+///
+pub trait CommitLoggerExt: AsyncCommitLog {
+    /// 开始重播提交日志，回调时传递事务唯一ID，块同步时间和负载，返回重播的日志数量和字节数量
+    fn start_replay_ext<B, F>(&self, callback: Arc<F>)
+        -> BoxFuture<'static, Result<(usize, usize)>>
+    where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+          F: Fn(Option<(Self::Cid, LogMethod, u64, B)>) -> Result<()> + Send + Sync + 'static;
+}
 
 ///
 /// 基于日志文件的提交日志记录器的构建器
@@ -562,6 +573,114 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
     drop(check_pointes_locked); //立即释放检查点表的异步锁
 }
 
+impl CommitLoggerExt for CommitLogger {
+    fn start_replay_ext<B, F>(&self, mut callback: Arc<F>)
+                              -> BoxFuture<'static, Result<(usize, usize)>>
+    where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+          F: Fn(Option<(Self::Cid, LogMethod, u64, B)>) -> Result<()> + Send + Sync + 'static
+    {
+        self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
+        let commit_logger = self.clone();
+
+        async move {
+            if let Some(writable_path) = commit_logger.0.file.writable_path() {
+                //提交日志记录器，当前有可写日志文件
+                match writable_path.metadata() {
+                    Err(e) => {
+                        //获取提交日志记录器的当前可写日志文件的元信息失败，则立即返回错误原因
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Replay commit log failed, path: {:?}, reason: {:?}",
+                                                      writable_path,
+                                                      e)));
+                    },
+                    Ok(meta) => {
+                        //获取提交日志记录器的当前可写日志文件的元信息成功
+                        if meta.len() == 0 && commit_logger.0.file.readable_amount() == 0 {
+                            //提交日志记录器的当前没有提交日志，则停止重播，并立即返回
+                            return Ok((0, 0));
+                        }
+                    }
+                }
+            }
+
+            //提交日志记录器当前有未确认的提交日志，则开始重播
+            //首先强制生成新的可写文件，以保证所有需要重播的提交日志文件都是只读日志文件
+            if let Err(e) = commit_logger.0.file.split().await {
+                //强制生成新的可写文件失败，则立即返回错误原因
+                return Err(Error::new(ErrorKind::Other,
+                                      format!("Replay commit log failed, reason: {:?}",
+                                              e)));
+            }
+
+            //设置需要重播的所有有效的只读日志文件
+            let mut invalid_only_read_paths = Vec::new(); //无效的只读日志文件路径列表
+            let mut only_read_paths = commit_logger.0.file.all_readable_path();
+            for only_read_path in only_read_paths {
+                match only_read_path.metadata() {
+                    Err(e) => {
+                        //获取只读日志文件的元信息失败，则立即返回错误原因
+                        return Err(Error::new(ErrorKind::Other,
+                                              format!("Replay commit log failed, path: {:?}, reason: {:?}",
+                                                      only_read_path,
+                                                      e)));
+                    },
+                    Ok(meta) => {
+                        //获取只读日志文件的元信息成功
+                        if meta.len() == 0 {
+                            //只读日志文件没有内容，则不将无效的只读日志文件追加到需要重播的提交日志的只读日志文件路径列表
+                            //注意不要在重播完成之前将无效的只读日志文件设置为备份的只读日志文件，这会导致日志文件无法正常加载只读日志文件
+                            invalid_only_read_paths.push(only_read_path);
+                            continue;
+                        }
+                    }
+                }
+
+                //将有效的只读日志文件追加到需要重播的提交日志的只读日志文件路径列表
+                commit_logger.0.replay_only_reads.lock().push_back(only_read_path);
+            }
+            if let Some(path) = commit_logger.0.replay_only_reads.lock().pop_front() {
+                //存在需要重播的只读日志文件，则将需要重播的首个只读日志文件，设置为首个可写检查点
+                *commit_logger.0.writable.lock() = (Arc::new(AtomicU64::new(0)), Arc::new(path));
+            }
+
+            //构建提交日志加载器
+            let mut loader = CommitLoggerLoaderExt {
+                logger: commit_logger.clone(),
+                buf: Vec::new(),
+                log_file: None,
+                callback,
+                result: Ok((0, 0)),
+                marker: PhantomData,
+            };
+
+            //从前往后的加载提交日志
+            if let Err(e) = commit_logger.0.file.load_before_with_payload_time(&mut loader,
+                                                                               None,
+                                                                               DEFAULT_LOAD_BUFFER_LEN,
+                                                                               true).await {
+                //加载提交日志错误，则立即返回错误原因
+                return Err(e);
+            }
+
+            //将无效的只读日志文件设置为备份的只读日志文件
+            for invalid_only_read_path in invalid_only_read_paths {
+                if let Err(e) = commit_logger
+                    .0
+                    .file.readable_to_back(invalid_only_read_path.clone())
+                    .await {
+                    //将无效的只读日志文件设置为备份的只读日志文件错误，则立即返回错误原因
+                    return Err(Error::new(ErrorKind::Other,
+                                          format!("Replay commit log failed, path: {:?}, reason: {:?}",
+                                                  invalid_only_read_path,
+                                                  e)));
+                }
+            }
+
+            loader.result()
+        }.boxed()
+    }
+}
+
 // 基于日志文件的内部提交日志记录器
 struct InnerCommitLogger {
     rt:                     MultiTaskRuntime<()>,                                   //异步运行时
@@ -650,6 +769,7 @@ impl<
         }
     }
 }
+
 // 为重播提交日志，将下一个需要重播的提交日志，设置为可写检查点
 // 设置上一个可写检查点是否已完成确认，并将上一个可写检查点追加到只读检查点的文件路径列表
 fn next_check_point(logger: &CommitLogger) {
@@ -698,3 +818,112 @@ impl<
         self.result
     }
 }
+
+// 扩展的提交日志加载器
+struct CommitLoggerLoaderExt<
+    B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+    F: Fn(Option<(Guid, LogMethod, u64, B)>) -> Result<()> + Send + 'static,
+> {
+    logger:     CommitLogger,                           //提交日志记录器
+    buf:        Vec<(Guid, LogMethod, u64, Vec<u8>)>,   //提交日志缓冲区
+    log_file:   Option<PathBuf>,                        //当前正在加载的日志文件路径
+    callback:   Arc<F>,                                 //提交日志的重播回调
+    result:     Result<(usize, usize)>,                 //加载的结果
+    marker:     PhantomData<B>,
+}
+
+impl<
+    B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+    F: Fn(Option<(Guid, LogMethod, u64, B)>) -> Result<()> + Send + 'static,
+> PairLoaderExt for CommitLoggerLoaderExt<B, F> {
+    fn is_require(&self,
+                  _log_file: Option<&PathBuf>,
+                  _payload_time: u64,
+                  _key: &Vec<u8>) -> bool {
+        //提交日志的所有日志都需要加载
+        true
+    }
+
+    fn load(&mut self,
+            log_file: Option<&PathBuf>,
+            method: LogMethod,
+            payload_time: u64,
+            key: Vec<u8>,
+            value: Option<Vec<u8>>) {
+        if self.result.is_err() {
+            //如果加载结果已经设置为错误，则忽略后续的所有加载
+            return;
+        }
+
+        if let Some(log_file) = log_file {
+            if self.log_file.is_none() {
+                //正在加载首个日志文件的首个键值对，则设置当前正在加载的日志文件路径到提交日志加载器
+                self.log_file = Some(log_file.clone());
+            }
+
+            if self.log_file.as_ref().unwrap() != log_file {
+                //提交日志加载器正在加载的日志文件与正在加载的日志文件不相同
+                //则表示已加载完一个日志文件，则从提交日志加载器的日志缓冲区的栈顶开始弹出所有待重播的提交日志，并同步执行重播回调
+                while let Some((commit_uid, method, time, log)) = self.buf.pop() {
+                    //执行重播回调
+                    if let Err(e) = (self.callback)(Some((commit_uid.clone(), method, time, B::from(log)))) {
+                        //执行重播回调失败，则立即设置错误原因
+                        self.result = Err(Error::new(ErrorKind::Other, format!("Replay commit log failed, commit_uid: {:?}, reason: {:?}", commit_uid, e)));
+                    }
+                }
+
+                //重置当前正在加载的日志文件路径到提交日志加载器
+                self.log_file = Some(log_file.clone());
+
+                //已重播完成当前的日志文件，则将下一个需要重播的提交日志，设置为可写检查点
+                //保证下一个加载的日志文件，在追加重播的提交日志时，使用对应的可写检查点
+                next_check_point(&self.logger);
+            }
+
+            //将加载的日志写入提交日志加载器的日志缓冲区
+            let uid = u128::from_le_bytes(key.try_into().unwrap());
+            let commit_uid = Guid(uid);
+            if let Some(log) = value {
+                //更新加载结果
+                if let Ok((log_count, bytes_count)) = self.result {
+                    self.result = Ok((log_count + 1, bytes_count + 16 + log.len()));
+                }
+
+                self.buf.push((commit_uid, method, payload_time, log));
+            }
+        }
+    }
+}
+
+impl<
+    B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
+    F: Fn(Option<(Guid, LogMethod, u64, B)>) -> Result<()> + Send + 'static,
+> CommitLoggerLoaderExt<B, F> {
+    //获取加载结果
+    pub fn result(mut self) -> Result<(usize, usize)> {
+        if self.buf.len() > 0 {
+            //加载缓冲区未清空，则表示只加载了一个提交日志的日志文件
+            //则从提交日志加载器的日志缓冲区的栈顶开始弹出所有待重播的提交日志，并同步执行重播回调
+            while let Some((commit_uid, method, time, log)) = self.buf.pop() {
+                //执行重播回调
+                if let Err(e) = (self.callback)(Some((commit_uid.clone(), method, time, B::from(log)))) {
+                    //执行重播回调失败，则立即设置错误原因
+                    self.result = Err(Error::new(ErrorKind::Other,
+                                                 format!("Replay commit log failed, commit_uid: {:?}, reason: {:?}",
+                                                         commit_uid,
+                                                         e)));
+                }
+            }
+
+            //所有的需要重播的日志文件已重播完成，则将提交日志的当前可写文件，设置为新的可写检查点
+            //也保证了所有被重播的日志文件，成为提交日志的只读日志文件
+            next_check_point(&self.logger);
+        }
+
+        //加载已完成
+        (self.callback)(None);
+        self.result
+    }
+}
+
+
