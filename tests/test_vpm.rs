@@ -15,7 +15,7 @@ use pi_assets::{asset::{Asset, Size, Garbageer, GarbageGuard},
                 mgr::AssetMgr,
                 allocator::Allocator};
 use pi_async_rt::rt::{AsyncRuntime,
-                      AsyncValueNonBlocking,
+                      AsyncValue,
                       multi_thread::MultiTaskRuntimeBuilder,
                       startup_global_time_loop};
 
@@ -73,7 +73,7 @@ fn test_async_value() {
     let rt_copy = rt.clone();
     rt.spawn(async move {
         let rt_clone = rt_copy.clone();
-        let value = AsyncValueNonBlocking::new();
+        let value = AsyncValue::new();
         let value_copy = value.clone();
         rt_copy.spawn(async move {
             let value_clone = value_copy.clone();

@@ -10,7 +10,8 @@ use crossbeam_channel::{unbounded, bounded};
 use rand::{Rng, SeedableRng, seq::SliceRandom, rngs::SmallRng};
 use persy::{Config, Persy, ValueMode, PersyId, ToSegmentId};
 
-use pi_async_rt::rt::multi_thread::MultiTaskRuntimeBuilder;
+use pi_async_rt::rt::{AsyncRuntime,
+                      multi_thread::MultiTaskRuntimeBuilder};
 
 #[bench]
 fn bench_random_insert_persy(b: &mut Bencher) {
@@ -40,7 +41,7 @@ fn bench_random_insert_persy(b: &mut Bencher) {
 
             let index = *idx;
             let mut tx = persy.begin().unwrap();
-            rt.spawn(rt.alloc(), async move {
+            rt.spawn(async move {
                 if let Ok(id) = tx.insert("test_seg", index.to_le_bytes().as_slice()) {
                     if let Ok(_) = tx.put("test_index", index, id) {
                         if let Ok(prepared) = tx.prepare() {
@@ -68,7 +69,7 @@ fn bench_random_insert_persy(b: &mut Bencher) {
                 Err(e) => {
                     println!(
                         "!!!!!!recv timeout, len: {}, timer_len: {}, e: {:?}",
-                        rt.timing_len(),
+                        rt.wait_len(),
                         rt.len(),
                         e
                     );
