@@ -10,7 +10,7 @@ use crossbeam_channel::{unbounded, bounded};
 use rand::{Rng, SeedableRng, seq::SliceRandom, rngs::SmallRng};
 use persy::{Config, Persy, ValueMode, PersyId, ToSegmentId};
 
-use r#async::rt::multi_thread::MultiTaskRuntimeBuilder;
+use pi_async_rt::rt::multi_thread::MultiTaskRuntimeBuilder;
 
 #[bench]
 fn bench_random_insert_persy(b: &mut Bencher) {
