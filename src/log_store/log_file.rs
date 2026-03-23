@@ -740,12 +740,12 @@ impl LogFile {
         Ok(())
     }
 
-    //提交当前日志块，返回提交是否成功
-    pub async fn commit(&self,
-                        mut log_uid: usize,
-                        is_forcibly: bool,
-                        is_split: bool,
-                        timeout: Option<usize>) -> Result<()> {
+    async fn commit_inner(&self,
+                          mut log_uid: usize,
+                          is_forcibly: bool,
+                          is_split: bool,
+                          timeout: Option<usize>,
+                          use_owned_batch: bool) -> Result<()> {
         let mut commit_block = None;
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
 
@@ -818,9 +818,18 @@ impl LogFile {
             //写文件
             unsafe {
                 let mut async_file = Box::from_raw(self.0.writable.load(Ordering::Relaxed));
-                match (*async_file).as_mut().unwrap().1.write(0,
-                                                              Arc::from(Vec::from(block)),
-                                                              WriteOptions::Sync(true)).await {
+                let write_result = if use_owned_batch {
+                    let batch = Arc::new(vec![Vec::from(block)]);
+                    (*async_file).as_mut().unwrap().1.write_batch(0,
+                                                                  batch,
+                                                                  WriteOptions::Sync(true)).await
+                } else {
+                    (*async_file).as_mut().unwrap().1.write(0,
+                                                            Arc::from(Vec::from(block)),
+                                                            WriteOptions::Sync(true)).await
+                };
+
+                match write_result {
                     Err(e) => {
                         //同步日志块失败，则立即返回错误
                         let waits = (&mut *mutex);
@@ -897,6 +906,26 @@ impl LogFile {
                                                      Ordering::Relaxed);
         self.0.commited_uid.store(log_uid, Ordering::Relaxed); //更新已提交完成的日志id
         Ok(())
+    }
+
+    //提交当前日志块，返回提交是否成功
+    pub async fn commit(&self,
+                        log_uid: usize,
+                        is_forcibly: bool,
+                        is_split: bool,
+                        timeout: Option<usize>) -> Result<()> {
+        self.commit_inner(log_uid, is_forcibly, is_split, timeout, false).await
+    }
+
+    // 仅供 quick repair 的立即 flush 使用。
+    // 这里通过 write_batch 持有 owned buffer 直到异步写完成，避免快路径下的大块日志提交
+    // 复用默认 write 路径时出现额外的缓冲生命周期风险。
+    pub async fn commit_owned(&self,
+                              log_uid: usize,
+                              is_forcibly: bool,
+                              is_split: bool,
+                              timeout: Option<usize>) -> Result<()> {
+        self.commit_inner(log_uid, is_forcibly, is_split, timeout, true).await
     }
 
     //延迟提交，返回延迟提交是否成功

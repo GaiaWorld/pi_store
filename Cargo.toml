@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "File storage"
@@ -19,7 +19,7 @@ bytes = "~1.11"
 lazy_static = "1.5"
 pi-async-rt = "0.2"
 pi_async_file = "0.7"
-pi_async_transaction = "~0.10"
+pi_async_transaction = { version = "~0.10", path = "../pi_async_transaction" }
 async-lock = "3.0"
 crossbeam-channel = "0.5"
 dashmap = "6.1"
@@ -41,4 +41,3 @@ rand = { version = "0.8", features = ["small_rng"] }
 persy = "1.1"
 lz4 = "~1.25"
 redb = "~2.2"
-
