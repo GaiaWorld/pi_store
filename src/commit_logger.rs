@@ -5,10 +5,12 @@ use std::collections::VecDeque;
 use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc,
                 atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+use std::time::Instant;
 
 use futures::future::{FutureExt, BoxFuture};
 use async_lock::Mutex;
 use bytes::BufMut;
+use log::debug;
 
 use pi_guid::Guid;
 use pi_hash::XHashMap;
@@ -148,6 +150,7 @@ impl CommitLoggerBuilder {
         let is_replaying = AtomicBool::new(false); //默认没有重播
         let replay_only_reads = SpinLock::new(VecDeque::new());
         let replay_confirm_buf = SpinLock::new(VecDeque::new());
+        let replay_file_stats = SpinLock::new(XHashMap::default());
         let commit_log_count = AtomicUsize::new(0);
         let confirm_commited_count = AtomicUsize::new(0);
 
@@ -163,6 +166,7 @@ impl CommitLoggerBuilder {
             is_replaying,
             replay_only_reads,
             replay_confirm_buf,
+            replay_file_stats,
             commit_log_count,
             confirm_commited_count,
         };
@@ -295,7 +299,11 @@ impl AsyncCommitLog for CommitLogger {
                             if prev && is_finish_confirm {
                                 //上一个只读检查点已完成确认，且当前只读检查点也完成了确认
                                 //则将当前只读检查点的日志文件设置为备份的只读文件，并从只读检查点的文件路径列表中移除
-                                let _ = logger.0.file.readable_to_back(path).await?;
+                                let file_size_bytes = path.metadata().ok().map(|meta| meta.len());
+                                let _ = logger.0.file.readable_to_back(path.clone()).await?;
+                                on_replay_file_promoted_to_back(&logger,
+                                                                &path,
+                                                                file_size_bytes);
                             } else if !prev {
                                 //上一个只读检查点未完成确认，则需要等待上一个只读检查点完成确认后，再处理当前只读检查点
                                 swap.push_back((path, is_finish_confirm));
@@ -318,6 +326,8 @@ impl AsyncCommitLog for CommitLogger {
         where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
+        self.0.replay_file_stats.lock().clear();
+        debug!("Commit logger start_replay begin");
         let commit_logger = self.clone();
 
         async move {
@@ -368,6 +378,10 @@ impl AsyncCommitLog for CommitLogger {
                 //将有效的只读日志文件追加到需要重播的提交日志的只读日志文件路径列表
                 commit_logger.0.replay_only_reads.lock().push_back(only_read_path);
             }
+            let replay_file_count = commit_logger.0.replay_only_reads.lock().len();
+            debug!("Commit logger start_replay_by_file prepared replay files, readable_files: {}, invalid_empty_files: {}",
+                   replay_file_count,
+                   invalid_only_read_paths.len());
             if let Some(path) = commit_logger.0.replay_only_reads.lock().pop_front() {
                 //存在需要重播的只读日志文件，则将需要重播的首个只读日志文件，设置为首个可写检查点
                 *commit_logger.0.writable.lock() = (Arc::new(AtomicU64::new(0)), Arc::new(path));
@@ -378,6 +392,9 @@ impl AsyncCommitLog for CommitLogger {
                 logger: commit_logger.clone(),
                 buf: Vec::new(),
                 log_file: None,
+                current_log_count: 0,
+                current_bytes: 0,
+                current_begin: None,
                 callback,
                 result: Ok((0, 0)),
                 marker: PhantomData,
@@ -403,7 +420,13 @@ impl AsyncCommitLog for CommitLogger {
                 }
             }
 
-            loader.result()
+            let replay_result = loader.result();
+            if let Ok((replayed_logs, replayed_bytes)) = &replay_result {
+                debug!("Commit logger start_replay finished loading, replayed_logs: {}, replayed_bytes: {}",
+                       replayed_logs,
+                       replayed_bytes);
+            }
+            replay_result
         }.boxed()
     }
 
@@ -414,6 +437,8 @@ impl AsyncCommitLog for CommitLogger {
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static,
               G: Fn() -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
+        self.0.replay_file_stats.lock().clear();
+        debug!("Commit logger start_replay_by_file begin");
         let commit_logger = self.clone();
 
         async move {
@@ -464,6 +489,10 @@ impl AsyncCommitLog for CommitLogger {
                 //将有效的只读日志文件追加到需要重播的提交日志的只读日志文件路径列表
                 commit_logger.0.replay_only_reads.lock().push_back(only_read_path);
             }
+            let replay_file_count = commit_logger.0.replay_only_reads.lock().len();
+            debug!("Commit logger start_replay prepared replay files, readable_files: {}, invalid_empty_files: {}",
+                   replay_file_count,
+                   invalid_only_read_paths.len());
             if let Some(path) = commit_logger.0.replay_only_reads.lock().pop_front() {
                 //存在需要重播的只读日志文件，则将需要重播的首个只读日志文件，设置为首个可写检查点
                 *commit_logger.0.writable.lock() = (Arc::new(AtomicU64::new(0)), Arc::new(path));
@@ -474,6 +503,9 @@ impl AsyncCommitLog for CommitLogger {
                 logger: commit_logger.clone(),
                 buf: Vec::new(),
                 log_file: None,
+                current_log_count: 0,
+                current_bytes: 0,
+                current_begin: None,
                 callback,
                 file_callback: file_finished,
                 result: Ok((0, 0)),
@@ -500,7 +532,13 @@ impl AsyncCommitLog for CommitLogger {
                 }
             }
 
-            loader.result()
+            let replay_result = loader.result();
+            if let Ok((replayed_logs, replayed_bytes)) = &replay_result {
+                debug!("Commit logger start_replay_by_file finished loading, replayed_logs: {}, replayed_bytes: {}",
+                       replayed_logs,
+                       replayed_bytes);
+            }
+            replay_result
         }.boxed()
     }
 
@@ -545,15 +583,31 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
+            let buffered_confirms = logger.0.replay_confirm_buf.lock().len();
+            let replaying_files = logger.0.replay_file_stats.lock().len();
+            let pending_only_reads = logger.0.only_reads.lock().len();
+            debug!("Commit logger finish_replay begin, buffered_confirms: {}, replaying_files_waiting_confirm: {}, pending_only_reads: {}",
+                   buffered_confirms,
+                   replaying_files,
+                   pending_only_reads);
             //设置为已完成重播
             logger.0.is_replaying.store(false, Ordering::SeqCst);
 
             //执行重播时缓冲的确认提交日志。
             //这一步仍然是 replay confirm 的唯一统一入口，文件级 flush 不会改变这个时机。
             let replay_confirms = &mut *logger.0.replay_confirm_buf.lock();
+            let mut drained_confirms = 0usize;
             while let Some(commit_uid) = replay_confirms.pop_front() {
                 let _ = logger.confirm(commit_uid).await?;
+                drained_confirms += 1;
             }
+
+            let remaining_replay_files = logger.0.replay_file_stats.lock().len();
+            let remaining_only_reads = logger.0.only_reads.lock().len();
+            debug!("Commit logger finish_replay end, drained_confirms: {}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
+                   drained_confirms,
+                   remaining_replay_files,
+                   remaining_only_reads);
 
             Ok(())
         }.boxed()
@@ -793,8 +847,16 @@ struct InnerCommitLogger {
     is_replaying:           AtomicBool,                                             //是否正在重播
     replay_only_reads:      SpinLock<VecDeque<PathBuf>>,                            //需要重播的提交日志的只读日志文件路径列表
     replay_confirm_buf:     SpinLock<VecDeque<Guid>>,                               //已确认的重播事务的提交唯一id缓冲区
+    replay_file_stats:      SpinLock<XHashMap<PathBuf, ReplayFileStats>>,           //当前 repair/replay 的按文件统计
     commit_log_count:       AtomicUsize,                                            //提交日志的数量
     confirm_commited_count: AtomicUsize,                                            //确认提交的数量
+}
+
+#[derive(Debug)]
+struct ReplayFileStats {
+    replayed_logs:  usize,   //当前物理日志文件中的事务日志数量
+    replayed_bytes: usize,   //当前物理日志文件中的事务日志字节数
+    begin:          Instant, //当前物理日志文件进入 replay 流程的时间
 }
 
 // 提交日志加载器
@@ -802,12 +864,15 @@ struct CommitLoggerLoader<
     B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
     F: Fn(Guid, B) -> Result<()> + Send + 'static,
 > {
-    logger:     CommitLogger,           //提交日志记录器
-    buf:        Vec<(Guid, Vec<u8>)>,   //提交日志缓冲区
-    log_file:   Option<PathBuf>,        //当前正在加载的日志文件路径
-    callback:   Arc<F>,                 //提交日志的重播回调
-    result:     Result<(usize, usize)>, //加载的结果
-    marker:     PhantomData<B>,
+    logger:            CommitLogger,           //提交日志记录器
+    buf:               Vec<(Guid, Vec<u8>)>,   //提交日志缓冲区
+    log_file:          Option<PathBuf>,        //当前正在加载的日志文件路径
+    current_log_count: usize,                  //当前日志文件中的事务日志数量
+    current_bytes:     usize,                  //当前日志文件中的事务日志字节数
+    current_begin:     Option<Instant>,        //当前日志文件进入 replay 流程的时间
+    callback:          Arc<F>,                 //提交日志的重播回调
+    result:            Result<(usize, usize)>, //加载的结果
+    marker:            PhantomData<B>,
 }
 
 impl<
@@ -833,6 +898,7 @@ impl<
             if self.log_file.is_none() {
                 //正在加载首个日志文件的首个键值对，则设置当前正在加载的日志文件路径到提交日志加载器
                 self.log_file = Some(log_file.clone());
+                self.current_begin = Some(Instant::now());
             }
 
             if self.log_file.as_ref().unwrap() != log_file {
@@ -846,8 +912,19 @@ impl<
                     }
                 }
 
+                if self.result.is_ok() {
+                    finish_replay_file_stats(&self.logger,
+                                             self.log_file.as_ref().unwrap().clone(),
+                                             self.current_log_count,
+                                             self.current_bytes,
+                                             self.current_begin.take().unwrap());
+                }
+
                 //重置当前正在加载的日志文件路径到提交日志加载器
                 self.log_file = Some(log_file.clone());
+                self.current_log_count = 0;
+                self.current_bytes = 0;
+                self.current_begin = Some(Instant::now());
 
                 //已重播完成当前的日志文件，则将下一个需要重播的提交日志，设置为可写检查点
                 //保证下一个加载的日志文件，在追加重播的提交日志时，使用对应的可写检查点
@@ -863,6 +940,8 @@ impl<
                     self.result = Ok((log_count + 1, bytes_count + 16 + log.len()));
                 }
 
+                self.current_log_count += 1;
+                self.current_bytes += 16 + log.len();
                 self.buf.push((commit_uid, log));
             }
         }
@@ -909,6 +988,14 @@ impl<
                 }
             }
 
+            if self.result.is_ok() {
+                finish_replay_file_stats(&self.logger,
+                                         self.log_file.as_ref().unwrap().clone(),
+                                         self.current_log_count,
+                                         self.current_bytes,
+                                         self.current_begin.take().unwrap());
+            }
+
             //所有的需要重播的日志文件已重播完成，则将提交日志的当前可写文件，设置为新的可写检查点
             //也保证了所有被重播的日志文件，成为提交日志的只读日志文件
             next_check_point(&self.logger);
@@ -924,13 +1011,16 @@ struct CommitLoggerLoaderByFile<
     F: Fn(Guid, B) -> Result<()> + Send + 'static,
     G: Fn() -> Result<()> + Send + 'static,
 > {
-    logger:         CommitLogger,           //提交日志记录器
-    buf:            Vec<(Guid, Vec<u8>)>,   //当前文件的提交日志缓冲区
-    log_file:       Option<PathBuf>,        //当前正在加载的日志文件路径
-    callback:       Arc<F>,                 //逐条记录的重播回调
-    file_callback:  Arc<G>,                 //当前文件已重播完成的回调
-    result:         Result<(usize, usize)>, //加载的结果
-    marker:         PhantomData<B>,
+    logger:            CommitLogger,           //提交日志记录器
+    buf:               Vec<(Guid, Vec<u8>)>,   //当前文件的提交日志缓冲区
+    log_file:          Option<PathBuf>,        //当前正在加载的日志文件路径
+    current_log_count: usize,                  //当前日志文件中的事务日志数量
+    current_bytes:     usize,                  //当前日志文件中的事务日志字节数
+    current_begin:     Option<Instant>,        //当前日志文件进入 replay 流程的时间
+    callback:          Arc<F>,                 //逐条记录的重播回调
+    file_callback:     Arc<G>,                 //当前文件已重播完成的回调
+    result:            Result<(usize, usize)>, //加载的结果
+    marker:            PhantomData<B>,
 }
 
 impl<
@@ -957,6 +1047,7 @@ impl<
             if self.log_file.is_none() {
                 //正在加载首个日志文件的首个键值对，则设置当前正在加载的日志文件路径到提交日志加载器
                 self.log_file = Some(log_file.clone());
+                self.current_begin = Some(Instant::now());
             }
 
             if self.log_file.as_ref().unwrap() != log_file {
@@ -980,8 +1071,19 @@ impl<
                     }
                 }
 
+                if self.result.is_ok() {
+                    finish_replay_file_stats(&self.logger,
+                                             self.log_file.as_ref().unwrap().clone(),
+                                             self.current_log_count,
+                                             self.current_bytes,
+                                             self.current_begin.take().unwrap());
+                }
+
                 //重置当前正在加载的日志文件路径到提交日志加载器
                 self.log_file = Some(log_file.clone());
+                self.current_log_count = 0;
+                self.current_bytes = 0;
+                self.current_begin = Some(Instant::now());
 
                 //已重播完成当前的日志文件，则将下一个需要重播的提交日志，设置为可写检查点
                 //保证下一个加载的日志文件，在追加重播的提交日志时，使用对应的可写检查点
@@ -997,6 +1099,8 @@ impl<
                     self.result = Ok((log_count + 1, bytes_count + 16 + log.len()));
                 }
 
+                self.current_log_count += 1;
+                self.current_bytes += 16 + log.len();
                 self.buf.push((commit_uid, log));
             }
         }
@@ -1034,12 +1138,58 @@ impl<
                 }
             }
 
+            if self.result.is_ok() {
+                finish_replay_file_stats(&self.logger,
+                                         self.log_file.as_ref().unwrap().clone(),
+                                         self.current_log_count,
+                                         self.current_bytes,
+                                         self.current_begin.take().unwrap());
+            }
+
             //所有的需要重播的日志文件已重播完成，则将提交日志的当前可写文件，设置为新的可写检查点
             //也保证了所有被重播的日志文件，成为提交日志的只读日志文件
             next_check_point(&self.logger);
         }
 
         self.result
+    }
+}
+
+#[inline]
+fn finish_replay_file_stats(logger: &CommitLogger,
+                            path: PathBuf,
+                            replayed_logs: usize,
+                            replayed_bytes: usize,
+                            begin: Instant) {
+    let replay_elapsed_ms = begin.elapsed().as_millis();
+    debug!("Replay commit log file replayed and waiting confirm, path: {:?}, logs: {}, replayed_bytes: {}, replay_elapsed_ms: {}",
+           path,
+           replayed_logs,
+           replayed_bytes,
+           replay_elapsed_ms);
+    logger.0.replay_file_stats.lock().insert(path,
+                                             ReplayFileStats {
+                                                 replayed_logs,
+                                                 replayed_bytes,
+                                                 begin,
+                                             });
+}
+
+#[inline]
+fn on_replay_file_promoted_to_back(logger: &CommitLogger,
+                                   path: &PathBuf,
+                                   file_size_bytes: Option<u64>) {
+    if let Some(stats) = logger.0.replay_file_stats.lock().remove(path) {
+        info!("Replay commit log file confirmed and promoted to .bak, path: {:?}, logs: {}, replayed_bytes: {}, file_size_bytes: {:?}, repair_confirm_elapsed_ms: {}",
+              path,
+              stats.replayed_logs,
+              stats.replayed_bytes,
+              file_size_bytes,
+              stats.begin.elapsed().as_millis());
+        debug!("Replay commit log file .bak promotion settled, path: {:?}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
+               path,
+               logger.0.replay_file_stats.lock().len(),
+               logger.0.only_reads.lock().len());
     }
 }
 
