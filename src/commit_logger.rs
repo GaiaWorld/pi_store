@@ -10,7 +10,7 @@ use std::time::Instant;
 use futures::future::{FutureExt, BoxFuture};
 use async_lock::Mutex;
 use bytes::BufMut;
-use log::debug;
+use log::info;
 
 use pi_guid::Guid;
 use pi_hash::XHashMap;
@@ -327,7 +327,7 @@ impl AsyncCommitLog for CommitLogger {
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
         self.0.replay_file_stats.lock().clear();
-        debug!("Commit logger start_replay begin");
+        info!("Commit logger start_replay begin");
         let commit_logger = self.clone();
 
         async move {
@@ -379,9 +379,9 @@ impl AsyncCommitLog for CommitLogger {
                 commit_logger.0.replay_only_reads.lock().push_back(only_read_path);
             }
             let replay_file_count = commit_logger.0.replay_only_reads.lock().len();
-            debug!("Commit logger start_replay_by_file prepared replay files, readable_files: {}, invalid_empty_files: {}",
-                   replay_file_count,
-                   invalid_only_read_paths.len());
+            info!("Commit logger start_replay prepared replay files, readable_files: {}, invalid_empty_files: {}",
+                  replay_file_count,
+                  invalid_only_read_paths.len());
             if let Some(path) = commit_logger.0.replay_only_reads.lock().pop_front() {
                 //存在需要重播的只读日志文件，则将需要重播的首个只读日志文件，设置为首个可写检查点
                 *commit_logger.0.writable.lock() = (Arc::new(AtomicU64::new(0)), Arc::new(path));
@@ -422,9 +422,9 @@ impl AsyncCommitLog for CommitLogger {
 
             let replay_result = loader.result();
             if let Ok((replayed_logs, replayed_bytes)) = &replay_result {
-                debug!("Commit logger start_replay finished loading, replayed_logs: {}, replayed_bytes: {}",
-                       replayed_logs,
-                       replayed_bytes);
+                info!("Commit logger start_replay finished loading, replayed_logs: {}, replayed_bytes: {}",
+                      replayed_logs,
+                      replayed_bytes);
             }
             replay_result
         }.boxed()
@@ -438,7 +438,7 @@ impl AsyncCommitLog for CommitLogger {
               G: Fn() -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
         self.0.replay_file_stats.lock().clear();
-        debug!("Commit logger start_replay_by_file begin");
+        info!("Commit logger start_replay_by_file begin");
         let commit_logger = self.clone();
 
         async move {
@@ -490,9 +490,9 @@ impl AsyncCommitLog for CommitLogger {
                 commit_logger.0.replay_only_reads.lock().push_back(only_read_path);
             }
             let replay_file_count = commit_logger.0.replay_only_reads.lock().len();
-            debug!("Commit logger start_replay prepared replay files, readable_files: {}, invalid_empty_files: {}",
-                   replay_file_count,
-                   invalid_only_read_paths.len());
+            info!("Commit logger start_replay_by_file prepared replay files, readable_files: {}, invalid_empty_files: {}",
+                  replay_file_count,
+                  invalid_only_read_paths.len());
             if let Some(path) = commit_logger.0.replay_only_reads.lock().pop_front() {
                 //存在需要重播的只读日志文件，则将需要重播的首个只读日志文件，设置为首个可写检查点
                 *commit_logger.0.writable.lock() = (Arc::new(AtomicU64::new(0)), Arc::new(path));
@@ -534,9 +534,9 @@ impl AsyncCommitLog for CommitLogger {
 
             let replay_result = loader.result();
             if let Ok((replayed_logs, replayed_bytes)) = &replay_result {
-                debug!("Commit logger start_replay_by_file finished loading, replayed_logs: {}, replayed_bytes: {}",
-                       replayed_logs,
-                       replayed_bytes);
+                info!("Commit logger start_replay_by_file finished loading, replayed_logs: {}, replayed_bytes: {}",
+                      replayed_logs,
+                      replayed_bytes);
             }
             replay_result
         }.boxed()
@@ -586,10 +586,10 @@ impl AsyncCommitLog for CommitLogger {
             let buffered_confirms = logger.0.replay_confirm_buf.lock().len();
             let replaying_files = logger.0.replay_file_stats.lock().len();
             let pending_only_reads = logger.0.only_reads.lock().len();
-            debug!("Commit logger finish_replay begin, buffered_confirms: {}, replaying_files_waiting_confirm: {}, pending_only_reads: {}",
-                   buffered_confirms,
-                   replaying_files,
-                   pending_only_reads);
+            info!("Commit logger finish_replay begin, buffered_confirms: {}, replaying_files_waiting_confirm: {}, pending_only_reads: {}",
+                  buffered_confirms,
+                  replaying_files,
+                  pending_only_reads);
             //设置为已完成重播
             logger.0.is_replaying.store(false, Ordering::SeqCst);
 
@@ -604,10 +604,10 @@ impl AsyncCommitLog for CommitLogger {
 
             let remaining_replay_files = logger.0.replay_file_stats.lock().len();
             let remaining_only_reads = logger.0.only_reads.lock().len();
-            debug!("Commit logger finish_replay end, drained_confirms: {}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
-                   drained_confirms,
-                   remaining_replay_files,
-                   remaining_only_reads);
+            info!("Commit logger finish_replay end, drained_confirms: {}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
+                  drained_confirms,
+                  remaining_replay_files,
+                  remaining_only_reads);
 
             Ok(())
         }.boxed()
@@ -1162,11 +1162,11 @@ fn finish_replay_file_stats(logger: &CommitLogger,
                             replayed_bytes: usize,
                             begin: Instant) {
     let replay_elapsed_ms = begin.elapsed().as_millis();
-    debug!("Replay commit log file replayed and waiting confirm, path: {:?}, logs: {}, replayed_bytes: {}, replay_elapsed_ms: {}",
-           path,
-           replayed_logs,
-           replayed_bytes,
-           replay_elapsed_ms);
+    info!("Replay commit log file replayed and waiting confirm, path: {:?}, logs: {}, replayed_bytes: {}, replay_elapsed_ms: {}",
+          path,
+          replayed_logs,
+          replayed_bytes,
+          replay_elapsed_ms);
     logger.0.replay_file_stats.lock().insert(path,
                                              ReplayFileStats {
                                                  replayed_logs,
@@ -1186,10 +1186,10 @@ fn on_replay_file_promoted_to_back(logger: &CommitLogger,
               stats.replayed_bytes,
               file_size_bytes,
               stats.begin.elapsed().as_millis());
-        debug!("Replay commit log file .bak promotion settled, path: {:?}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
-               path,
-               logger.0.replay_file_stats.lock().len(),
-               logger.0.only_reads.lock().len());
+        info!("Replay commit log file .bak promotion settled, path: {:?}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}",
+              path,
+              logger.0.replay_file_stats.lock().len(),
+              logger.0.only_reads.lock().len());
     }
 }
 
