@@ -263,7 +263,8 @@ impl AsyncCommitLog for CommitLogger {
 
                 if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
                     //当前已确认事务对应的检查点的计数已清空，则表示事务对应检查点的所有事务已完成确认
-                    if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
+                    let is_current_writable_check_point = check_point_path.as_ref() == logger.0.writable.lock().1.as_ref();
+                    if is_current_writable_check_point {
                         //当前已完成确认的检查点是当前可写检查点
                         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为已完成确认
                         let _ = new_check_point(&logger, true).await;
@@ -271,12 +272,15 @@ impl AsyncCommitLog for CommitLogger {
 
                     //整理只读检查点的文件路径列表中已完成确认且可以移除的只读检查点
                     let mut swap = VecDeque::new();
-                    {
+                    let mut matched_only_read_path = false;
+                    let mut promoted_now = 0usize;
+                    let (stalled_head_path, stalled_head_is_finish_confirm, finished_behind_stalled_head) = {
                         let only_reads = &mut *logger.0.only_reads.lock();
                         for (path, is_finish_confirm) in only_reads.iter_mut() {
                             if check_point_path.as_ref() == path {
                                 //当前已完成确认的检查点是只读检查点
                                 *is_finish_confirm = true; //标记只读检查点的状态为已完成确认
+                                matched_only_read_path = true;
                             } else {
                                 match path.metadata() {
                                     Err(e) => {
@@ -304,6 +308,7 @@ impl AsyncCommitLog for CommitLogger {
                                 on_replay_file_promoted_to_back(&logger,
                                                                 &path,
                                                                 file_size_bytes);
+                                promoted_now += 1;
                             } else if !prev {
                                 //上一个只读检查点未完成确认，则需要等待上一个只读检查点完成确认后，再处理当前只读检查点
                                 swap.push_back((path, is_finish_confirm));
@@ -313,8 +318,25 @@ impl AsyncCommitLog for CommitLogger {
                                 prev = false; //设置上一个只读检查点未完成确认
                             }
                         }
-                    }
+
+                        let (head_path, head_is_finish_confirm, finished_behind_head, _) =
+                            summarize_only_reads_queue(&swap);
+                        (head_path, head_is_finish_confirm, finished_behind_head)
+                    };
                     *logger.0.only_reads.lock() = swap; //更新只读检查点的文件路径列表
+
+                    let remaining_replay_files = logger.0.replay_file_stats.lock().len();
+                    let remaining_only_reads = logger.0.only_reads.lock().len();
+                    info!("Commit logger replay checkpoint confirmed, path: {:?}, matched_only_read_path: {}, current_writable_checkpoint: {}, promoted_now: {}, remaining_replay_files_waiting_confirm: {}, remaining_only_reads: {}, stalled_head_path: {:?}, stalled_head_finished: {:?}, finished_behind_stalled_head: {}",
+                          check_point_path,
+                          matched_only_read_path,
+                          is_current_writable_check_point,
+                          promoted_now,
+                          remaining_replay_files,
+                          remaining_only_reads,
+                          stalled_head_path,
+                          stalled_head_is_finish_confirm,
+                          finished_behind_stalled_head);
                 }
             }
 
@@ -608,6 +630,17 @@ impl AsyncCommitLog for CommitLogger {
                   drained_confirms,
                   remaining_replay_files,
                   remaining_only_reads);
+            if remaining_replay_files > 0 || remaining_only_reads > 0 {
+                let only_reads = logger.0.only_reads.lock();
+                let (head_path, head_is_finish_confirm, finished_behind_head, queue_total) =
+                    summarize_only_reads_queue(&only_reads);
+                info!("Commit logger finish_replay pending promotion summary, only_reads_head_path: {:?}, only_reads_head_finished: {:?}, finished_behind_head: {}, only_reads_total: {}, remaining_replay_files_waiting_confirm: {}",
+                      head_path,
+                      head_is_finish_confirm,
+                      finished_behind_head,
+                      queue_total,
+                      remaining_replay_files);
+            }
 
             Ok(())
         }.boxed()
@@ -1190,6 +1223,25 @@ fn on_replay_file_promoted_to_back(logger: &CommitLogger,
               path,
               logger.0.replay_file_stats.lock().len(),
               logger.0.only_reads.lock().len());
+    }
+}
+
+#[inline]
+fn summarize_only_reads_queue(queue: &VecDeque<(PathBuf, bool)>)
+    -> (Option<PathBuf>, Option<bool>, usize, usize) {
+    let total = queue.len();
+    if let Some((path, is_finish_confirm)) = queue.front() {
+        let finished_behind_head = queue
+            .iter()
+            .skip(1)
+            .filter(|(_, tail_is_finish_confirm)| *tail_is_finish_confirm)
+            .count();
+        (Some(path.clone()),
+         Some(*is_finish_confirm),
+         finished_behind_head,
+         total)
+    } else {
+        (None, None, 0, 0)
     }
 }
 
