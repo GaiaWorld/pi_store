@@ -706,6 +706,20 @@ impl AsyncCommitLog for CommitLogger {
         }.boxed()
     }
 
+    fn advance_replay_check_point(&self) -> BoxFuture<'static, Result<()>> {
+        let logger = self.clone();
+
+        async move {
+            if !logger.0.is_replaying.load(Ordering::Relaxed) {
+                return Err(Error::new(ErrorKind::Other,
+                                      "Advance replay check point failed, reason: commit logger is not replaying"));
+            }
+
+            next_check_point(&logger);
+            Ok(())
+        }.boxed()
+    }
+
     fn check_point_of(&self, commit_uid: Self::Cid) -> BoxFuture<'static, Option<usize>> {
         let logger = self.clone();
 
@@ -1198,9 +1212,6 @@ impl<
                 self.current_bytes = 0;
                 self.current_begin = Some(Instant::now());
 
-                //已重播完成当前的日志文件，则将下一个需要重播的提交日志，设置为可写检查点
-                //保证下一个加载的日志文件，在追加重播的提交日志时，使用对应的可写检查点
-                next_check_point(&self.logger);
             }
 
             //将加载的日志写入提交日志加载器的日志缓冲区
@@ -1259,9 +1270,6 @@ impl<
                                          self.current_begin.take().unwrap());
             }
 
-            //所有的需要重播的日志文件已重播完成，则将提交日志的当前可写文件，设置为新的可写检查点
-            //也保证了所有被重播的日志文件，成为提交日志的只读日志文件
-            next_check_point(&self.logger);
         }
 
         self.result

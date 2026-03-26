@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.9.7"
+version = "0.9.8"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "File storage"
