@@ -151,6 +151,7 @@ impl CommitLoggerBuilder {
         let replay_only_reads = SpinLock::new(VecDeque::new());
         let replay_confirm_buf = SpinLock::new(VecDeque::new());
         let replay_file_stats = SpinLock::new(XHashMap::default());
+        let replay_path_counters = SpinLock::new(XHashMap::default());
         let replay_duplicate_commit_uids = AtomicUsize::new(0);
         let commit_log_count = AtomicUsize::new(0);
         let confirm_commited_count = AtomicUsize::new(0);
@@ -168,6 +169,7 @@ impl CommitLoggerBuilder {
             replay_only_reads,
             replay_confirm_buf,
             replay_file_stats,
+            replay_path_counters,
             replay_duplicate_commit_uids,
             commit_log_count,
             confirm_commited_count,
@@ -351,6 +353,7 @@ impl AsyncCommitLog for CommitLogger {
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
         self.0.replay_file_stats.lock().clear();
+        self.0.replay_path_counters.lock().clear();
         self.0.replay_duplicate_commit_uids.store(0, Ordering::Relaxed);
         info!("Commit logger start_replay begin");
         let commit_logger = self.clone();
@@ -463,6 +466,7 @@ impl AsyncCommitLog for CommitLogger {
               G: Fn() -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
         self.0.replay_file_stats.lock().clear();
+        self.0.replay_path_counters.lock().clear();
         self.0.replay_duplicate_commit_uids.store(0, Ordering::Relaxed);
         info!("Commit logger start_replay_by_file begin");
         let commit_logger = self.clone();
@@ -659,15 +663,24 @@ impl AsyncCommitLog for CommitLogger {
                 drop(only_reads);
 
                 let mut head_remaining_check_points = 0usize;
+                let mut head_counter_value = None;
                 if let Some(ref head_path) = head_path {
                     let check_points = logger.0.check_points.lock().await;
                     head_remaining_check_points = check_points
                         .values()
                         .filter(|(_counter, path)| path.as_ref() == head_path)
                         .count();
+                    drop(check_points);
+
+                    head_counter_value = logger
+                        .0
+                        .replay_path_counters
+                        .lock()
+                        .get(head_path)
+                        .map(|counter| counter.load(Ordering::Acquire));
                 }
 
-                info!("Commit logger finish_replay pending promotion summary, only_reads_head_path: {:?}, only_reads_head_finished: {:?}, finished_behind_head: {}, only_reads_total: {}, remaining_replay_files_waiting_confirm: {}, remaining_check_points: {}, head_remaining_check_points: {}, replay_duplicate_commit_uids: {}",
+                info!("Commit logger finish_replay pending promotion summary, only_reads_head_path: {:?}, only_reads_head_finished: {:?}, finished_behind_head: {}, only_reads_total: {}, remaining_replay_files_waiting_confirm: {}, remaining_check_points: {}, head_remaining_check_points: {}, head_counter_value: {:?}, replay_duplicate_commit_uids: {}",
                       head_path,
                       head_is_finish_confirm,
                       finished_behind_head,
@@ -675,7 +688,18 @@ impl AsyncCommitLog for CommitLogger {
                       remaining_replay_files,
                       remaining_check_points,
                       head_remaining_check_points,
+                      head_counter_value,
                       replay_duplicate_commit_uids);
+                if head_path.is_some()
+                    && head_is_finish_confirm == Some(false)
+                    && head_remaining_check_points == 0
+                {
+                    info!("Commit logger finish_replay stalled head detail, head_path: {:?}, head_counter_value: {:?}, finished_behind_head: {}, remaining_replay_files_waiting_confirm: {}",
+                          head_path,
+                          head_counter_value,
+                          finished_behind_head,
+                          remaining_replay_files);
+                }
             }
 
             Ok(())
@@ -917,6 +941,7 @@ struct InnerCommitLogger {
     replay_only_reads:      SpinLock<VecDeque<PathBuf>>,                            //需要重播的提交日志的只读日志文件路径列表
     replay_confirm_buf:     SpinLock<VecDeque<Guid>>,                               //已确认的重播事务的提交唯一id缓冲区
     replay_file_stats:      SpinLock<XHashMap<PathBuf, ReplayFileStats>>,           //当前 repair/replay 的按文件统计
+    replay_path_counters:   SpinLock<XHashMap<PathBuf, Arc<AtomicU64>>>,            //当前 repair/replay 的按文件检查点计数器
     replay_duplicate_commit_uids: AtomicUsize,                                      //重播时被覆盖的提交唯一id数量
     commit_log_count:       AtomicUsize,                                            //提交日志的数量
     confirm_commited_count: AtomicUsize,                                            //确认提交的数量
@@ -1023,9 +1048,27 @@ impl<
 fn next_check_point(logger: &CommitLogger) {
     {
         //将上一个可写检查点的日志文件追加到只读检查点的文件路径列表，等待这个检查点的所有重播事务的提交确认
-        let (_, last_writable_path) = &*logger.0.writable.lock();
+        let (last_writable_counter, last_writable_path) = &*logger.0.writable.lock();
         let only_read_path = last_writable_path.as_ref().clone();
-        logger.0.only_reads.lock().push_back((only_read_path, false));
+        let first_replay_only_read = {
+            let mut only_reads = logger.0.only_reads.lock();
+            let was_empty = only_reads.is_empty();
+            only_reads.push_back((only_read_path.clone(), false));
+            was_empty
+        };
+        if logger.0.is_replaying.load(Ordering::Relaxed) {
+            let counter = last_writable_counter.clone();
+            logger
+                .0
+                .replay_path_counters
+                .lock()
+                .insert(only_read_path.clone(), counter.clone());
+            if first_replay_only_read {
+                info!("Commit logger replay head only_read enqueued, path: {:?}, initial_finished: false, counter_value: {}",
+                      only_read_path,
+                      counter.load(Ordering::Acquire));
+            }
+        }
     }
 
     if let Some(path) = logger.0.replay_only_reads.lock().pop_front() {
@@ -1249,6 +1292,7 @@ fn finish_replay_file_stats(logger: &CommitLogger,
 fn on_replay_file_promoted_to_back(logger: &CommitLogger,
                                    path: &PathBuf,
                                    file_size_bytes: Option<u64>) {
+    logger.0.replay_path_counters.lock().remove(path);
     if let Some(stats) = logger.0.replay_file_stats.lock().remove(path) {
         info!("Replay commit log file confirmed and promoted to .bak, path: {:?}, logs: {}, replayed_bytes: {}, file_size_bytes: {:?}, repair_confirm_elapsed_ms: {}",
               path,
