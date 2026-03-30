@@ -30,7 +30,7 @@ pi_hash = "0.1"
 crc32fast = "~1.4"
 fastcmp = "1.0"
 quanta = "0.12"
-pi_assets = { version = "0.15", path = "../pi_assets" }
+pi_assets = { version = "0.16", path = "../pi_assets" }
 pi_share = "0.5"
 lzzzz = "~1.0"
 
