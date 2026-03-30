@@ -18,8 +18,8 @@ log = "0.4"
 bytes = "~1.11"
 lazy_static = "1.5"
 pi-async-rt = "0.3"
-pi_async_file = "0.7"
-pi_async_transaction = { version = "~0.10", path = "../pi_async_transaction" }
+pi_async_file = "0.8"
+pi_async_transaction = { version = "~0.11", path = "../pi_async_transaction" }
 async-lock = "3.0"
 crossbeam-channel = "0.5"
 dashmap = "6.1"
