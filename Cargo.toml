@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.9.8"
+version = "0.10.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "File storage"
@@ -17,7 +17,7 @@ futures = "0.3"
 log = "0.4"
 bytes = "~1.11"
 lazy_static = "1.5"
-pi-async-rt = "0.2"
+pi-async-rt = "0.3"
 pi_async_file = "0.7"
 pi_async_transaction = { version = "~0.10", path = "../pi_async_transaction" }
 async-lock = "3.0"
