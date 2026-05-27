@@ -774,10 +774,36 @@ impl LogFile {
                           is_split: bool,
                           timeout: Option<usize>,
                           use_owned_batch: bool) -> Result<()> {
+        let started = Instant::now();
+        let original_log_uid = log_uid;
         let mut commit_block = None;
+        eprintln!(
+            "pi_store log_file_commit_lock_begin log_path={:?} log_uid={} is_forcibly={} is_split={} timeout={:?} use_owned_batch={} commited_uid={} writable_size={}",
+            self.0.path,
+            original_log_uid,
+            is_forcibly,
+            is_split,
+            timeout,
+            use_owned_batch,
+            self.0.commited_uid.load(Ordering::Relaxed),
+            self.0.writable_len.load(Ordering::Relaxed),
+        );
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
+        eprintln!(
+            "pi_store log_file_commit_lock_ok log_path={:?} log_uid={} wait_elapsed_ms={}",
+            self.0.path,
+            original_log_uid,
+            started.elapsed().as_millis(),
+        );
 
         if log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
+            eprintln!(
+                "pi_store log_file_commit_already_done log_path={:?} log_uid={} commited_uid={} elapsed_ms={}",
+                self.0.path,
+                original_log_uid,
+                self.0.commited_uid.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+            );
             //指定的日志已提交，则立即返回提交成功，也不需要唤醒任何的等待提交完成的任务
             return Ok(());
         }
@@ -786,6 +812,13 @@ impl LogFile {
             //本次提交需要等待，当前正在进行的指定时间后的延迟提交
             if !self.0.delay_commit.load(Ordering::Relaxed) {
                 //等待的当前延迟提交已完成，则继续等待下次延迟提交的返回
+                eprintln!(
+                    "pi_store log_file_commit_delay_reschedule log_path={:?} log_uid={} timeout={:?} elapsed_ms={}",
+                    self.0.path,
+                    original_log_uid,
+                    timeout,
+                    started.elapsed().as_millis(),
+                );
                 drop(mutex); //释放提交锁
                 return self.delay_commit(log_uid, is_split, timeout).await;
             }
@@ -806,11 +839,31 @@ impl LogFile {
                     (&mut *mutex).push_back(sender);
                     drop(lock); //释放日志块锁
                     drop(mutex); //释放提交锁
+                    eprintln!(
+                        "pi_store log_file_commit_wait_begin log_path={:?} log_uid={} is_split={} elapsed_ms={}",
+                        self.0.path,
+                        original_log_uid,
+                        is_split,
+                        started.elapsed().as_millis(),
+                    );
                     match receiver.recv().await {
                         Err(e) => {
+                            eprintln!(
+                                "pi_store log_file_commit_wait_err log_path={:?} log_uid={} elapsed_ms={} error={:?}",
+                                self.0.path,
+                                original_log_uid,
+                                started.elapsed().as_millis(),
+                                e,
+                            );
                             return Err(Error::new(ErrorKind::Other, format!("Commit log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                         },
                         Ok(r) => {
+                            eprintln!(
+                                "pi_store log_file_commit_wait_ok log_path={:?} log_uid={} elapsed_ms={}",
+                                self.0.path,
+                                original_log_uid,
+                                started.elapsed().as_millis(),
+                            );
                             return r;
                         },
                     }
@@ -840,10 +893,25 @@ impl LogFile {
                                                              Ordering::Acquire,
                                                              Ordering::Relaxed);
 
+                eprintln!(
+                    "pi_store log_file_commit_empty_done log_path={:?} log_uid={} is_split={} elapsed_ms={}",
+                    self.0.path,
+                    original_log_uid,
+                    is_split,
+                    started.elapsed().as_millis(),
+                );
                 return Ok(());
             }
 
             //写文件
+            eprintln!(
+                "pi_store log_file_write_begin log_path={:?} log_uid={} block_len={} is_split={} elapsed_ms={}",
+                self.0.path,
+                log_uid,
+                block.len(),
+                is_split,
+                started.elapsed().as_millis(),
+            );
             unsafe {
                 let mut async_file = Box::from_raw(self.0.writable.load(Ordering::Relaxed));
                 let write_result = if use_owned_batch {
@@ -859,6 +927,14 @@ impl LogFile {
 
                 match write_result {
                     Err(e) => {
+                        eprintln!(
+                            "pi_store log_file_write_err log_path={:?} log_uid={} is_split={} elapsed_ms={} error={:?}",
+                            self.0.path,
+                            log_uid,
+                            is_split,
+                            started.elapsed().as_millis(),
+                            e,
+                        );
                         //同步日志块失败，则立即返回错误
                         let waits = (&mut *mutex);
                         //唤醒所有等待同步完成的任务
@@ -878,6 +954,14 @@ impl LogFile {
                         return Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                     },
                     Ok(len) => {
+                        eprintln!(
+                            "pi_store log_file_write_ok log_path={:?} log_uid={} write_len={} is_split={} elapsed_ms={}",
+                            self.0.path,
+                            log_uid,
+                            len,
+                            is_split,
+                            started.elapsed().as_millis(),
+                        );
                         //提交日志块成功
                         let waits = (&mut *mutex);
                         //唤醒所有等待提交完成的任务
@@ -892,16 +976,41 @@ impl LogFile {
                             //当前没有整理，则检查是否需要创建新的可写日志文件
                             if (self.0.writable_len.fetch_add(len, Ordering::Relaxed) + len >= self.0.size_limit) || is_split {
                                 //当前可写日志文件已达限制或需要强制分裂，则立即创建新的可写日志文件
+                                let new_log_index = self.0.log_id.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "pi_store log_file_append_writable_begin log_path={:?} log_uid={} new_log_index={} is_split={} elapsed_ms={}",
+                                    self.0.path,
+                                    log_uid,
+                                    new_log_index,
+                                    is_split,
+                                    started.elapsed().as_millis(),
+                                );
                                 match append_writable(self.0.rt.clone(),
                                                       self.0.path.clone(),
-                                                      self.0.log_id.fetch_add(1, Ordering::Relaxed)).await {
+                                                      new_log_index).await {
                                     Err(e) => {
+                                        eprintln!(
+                                            "pi_store log_file_append_writable_err log_path={:?} log_uid={} is_split={} elapsed_ms={} error={:?}",
+                                            self.0.path,
+                                            log_uid,
+                                            is_split,
+                                            started.elapsed().as_millis(),
+                                            e,
+                                        );
                                         //追加新的可写日志文件失败，则立即返回错误
                                         Box::into_raw(async_file); //避免释放可写文件
                                         self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                                         return Err(Error::new(ErrorKind::Other, format!("Append log file failed, path: {:?}, reason: {:?}", self.0.path, e)));
                                     },
                                     Ok((new_writable_path, new_writable)) => {
+                                        eprintln!(
+                                            "pi_store log_file_append_writable_ok log_path={:?} log_uid={} is_split={} new_writable_path={:?} elapsed_ms={}",
+                                            self.0.path,
+                                            log_uid,
+                                            is_split,
+                                            new_writable_path,
+                                            started.elapsed().as_millis(),
+                                        );
                                         //追加新的可写日志文件成功
                                         unsafe {
                                             if let Some((last_writable_path, _last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
@@ -933,6 +1042,13 @@ impl LogFile {
                                                      Ordering::Acquire,
                                                      Ordering::Relaxed);
         self.0.commited_uid.store(log_uid, Ordering::Relaxed); //更新已提交完成的日志id
+        eprintln!(
+            "pi_store log_file_commit_done log_path={:?} original_log_uid={} committed_log_uid={} elapsed_ms={}",
+            self.0.path,
+            original_log_uid,
+            log_uid,
+            started.elapsed().as_millis(),
+        );
         Ok(())
     }
 
@@ -987,7 +1103,19 @@ impl LogFile {
 
     //立即分裂当前的日志文件
     pub async fn split(&self) -> Result<usize> {
+        let started = Instant::now();
+        eprintln!(
+            "pi_store log_file_split_enter log_path={:?} commited_uid={} writable_size={}",
+            self.0.path,
+            self.0.commited_uid.load(Ordering::Relaxed),
+            self.0.writable_len.load(Ordering::Relaxed),
+        );
         let mut _mutex = self.0.commit_lock.lock().await; //获取提交锁
+        eprintln!(
+            "pi_store log_file_split_commit_lock_ok log_path={:?} wait_elapsed_ms={}",
+            self.0.path,
+            started.elapsed().as_millis(),
+        );
 
         if self.0.mutex_status.compare_exchange(false,
                                                 true,
@@ -995,15 +1123,35 @@ impl LogFile {
                                                 Ordering::Relaxed).is_ok() {
             //当前没有整理，则创建新的可写日志文件
             let new_log_index = self.0.log_id.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "pi_store log_file_split_append_writable_begin log_path={:?} new_log_index={} elapsed_ms={}",
+                self.0.path,
+                new_log_index,
+                started.elapsed().as_millis(),
+            );
             match append_writable(self.0.rt.clone(),
                                   self.0.path.clone(),
                                   new_log_index).await {
                 Err(e) => {
+                    eprintln!(
+                        "pi_store log_file_split_append_writable_err log_path={:?} new_log_index={} elapsed_ms={} error={:?}",
+                        self.0.path,
+                        new_log_index,
+                        started.elapsed().as_millis(),
+                        e,
+                    );
                     //追加新的可写日志文件失败，则立即返回错误
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                     Err(Error::new(ErrorKind::Other, format!("Split log file failed, path: {:?}, reason: {:?}", self.0.path, e)))
                 },
                 Ok((new_writable_path, new_writable)) => {
+                    eprintln!(
+                        "pi_store log_file_split_append_writable_ok log_path={:?} new_log_index={} new_writable_path={:?} elapsed_ms={}",
+                        self.0.path,
+                        new_log_index,
+                        new_writable_path,
+                        started.elapsed().as_millis(),
+                    );
                     //追加新的可写日志文件成功
                     unsafe {
                         if let Some((last_writable_path, _last_writable)) = (*self.0.writable.load(Ordering::Relaxed)).take() {
@@ -1017,10 +1165,21 @@ impl LogFile {
                     }
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
 
+                    eprintln!(
+                        "pi_store log_file_split_ok log_path={:?} new_log_index={} elapsed_ms={}",
+                        self.0.path,
+                        new_log_index,
+                        started.elapsed().as_millis(),
+                    );
                     Ok(new_log_index)
                 },
             }
         } else {
+            eprintln!(
+                "pi_store log_file_split_conflict log_path={:?} elapsed_ms={}",
+                self.0.path,
+                started.elapsed().as_millis(),
+            );
             //当前有整理与分裂冲突，则立即返回错误
             Err(Error::new(ErrorKind::WouldBlock, format!("Split log file failed, path: {:?}, reason: collect conflict", self.0.path)))
         }

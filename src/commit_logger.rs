@@ -10,7 +10,7 @@ use std::time::Instant;
 use futures::future::{FutureExt, BoxFuture};
 use async_lock::Mutex;
 use bytes::BufMut;
-use log::info;
+use log::{info, warn};
 
 use pi_guid::Guid;
 use pi_hash::XHashMap;
@@ -229,6 +229,17 @@ impl AsyncCommitLog for CommitLogger {
                 return Ok(0);
             }
 
+            eprintln!(
+                "pi_store append_check_points_lock_begin commit_uid={:?} log_path={:?} input_len={} writed_size={} log_file_limit={} is_replaying={} append_total={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                logger.0.writed_size.load(Ordering::Relaxed),
+                logger.0.log_file_limit,
+                logger.0.is_replaying.load(Ordering::Relaxed),
+                logger.0.commit_log_count.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+            );
             let mut check_pointes_locked = logger.0.check_points.lock().await;
             eprintln!(
                 "pi_store commit_append_lock_ok commit_uid={:?} log_path={:?} input_len={} check_points_len={} elapsed_ms={}",
@@ -336,12 +347,32 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
+            let started = Instant::now();
+            let writed_size = logger.0.writed_size.load(Ordering::Relaxed);
+            eprintln!(
+                "pi_store confirm_check_points_lock_begin commit_uid={:?} log_path={:?} writed_size={} log_file_limit={} is_replaying={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                writed_size,
+                logger.0.log_file_limit,
+                logger.0.is_replaying.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+            );
             let mut check_pointes_locked = logger.0.check_points.lock().await;
+            let will_new_check_point = logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit;
+            eprintln!(
+                "pi_store confirm_check_points_lock_ok commit_uid={:?} log_path={:?} check_points_len={} will_new_check_point={} wait_elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                check_pointes_locked.len(),
+                will_new_check_point,
+                started.elapsed().as_millis(),
+            );
 
-            if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
+            if will_new_check_point {
                 //提交日志的当前可写检查点对应的可写文件，已写入字节数量已达限制
                 //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-                let _ = new_check_point(&logger, false).await;
+                let _ = new_check_point(&logger, false, "confirm_limit").await;
             }
 
             if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
@@ -354,7 +385,7 @@ impl AsyncCommitLog for CommitLogger {
                     if is_current_writable_check_point {
                         //当前已完成确认的检查点是当前可写检查点
                         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为已完成确认
-                        let _ = new_check_point(&logger, true).await;
+                        let _ = new_check_point(&logger, true, "confirm_current_writable").await;
                     }
 
                     //整理只读检查点的文件路径列表中已完成确认且可以移除的只读检查点
@@ -427,6 +458,13 @@ impl AsyncCommitLog for CommitLogger {
                 }
             }
 
+            eprintln!(
+                "pi_store confirm_check_points_scope_end commit_uid={:?} log_path={:?} check_points_len={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                check_pointes_locked.len(),
+                started.elapsed().as_millis(),
+            );
             Ok(())
         }.boxed()
     }
@@ -839,8 +877,22 @@ impl AsyncCommitLog for CommitLogger {
 
         async move {
             //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-            let _check_pointes_locked = logger.0.check_points.lock().await;
-            new_check_point(&logger, false).await
+            let started = Instant::now();
+            eprintln!(
+                "pi_store append_check_point_lock_begin log_path={:?} writed_size={} log_file_limit={} elapsed_ms={}",
+                logger.0.file.path(),
+                logger.0.writed_size.load(Ordering::Relaxed),
+                logger.0.log_file_limit,
+                started.elapsed().as_millis(),
+            );
+            let check_pointes_locked = logger.0.check_points.lock().await;
+            eprintln!(
+                "pi_store append_check_point_lock_ok log_path={:?} check_points_len={} wait_elapsed_ms={}",
+                logger.0.file.path(),
+                check_pointes_locked.len(),
+                started.elapsed().as_millis(),
+            );
+            new_check_point(&logger, false, "append_check_point").await
         }.boxed()
     }
 
@@ -875,8 +927,47 @@ impl AsyncCommitLog for CommitLogger {
 // 为提交日志文件，异步创建新的可写检查点
 // 设置上一个可写检查点是否已完成确认，并将上一个可写检查点追加到只读检查点的文件路径列表
 async fn new_check_point(logger: &CommitLogger,
-                         is_finish_confirm: bool) -> Result<usize> {
-    let log_index = logger.0.file.split().await?; //立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
+                         is_finish_confirm: bool,
+                         caller: &'static str) -> Result<usize> {
+    let started = Instant::now();
+    eprintln!(
+        "pi_store new_check_point_begin caller={} log_path={:?} is_finish_confirm={} writed_size={} log_file_limit={} writable_size={} only_reads_len={}",
+        caller,
+        logger.0.file.path(),
+        is_finish_confirm,
+        logger.0.writed_size.load(Ordering::Relaxed),
+        logger.0.log_file_limit,
+        logger.0.file.writable_size(),
+        logger.0.only_reads.lock().len(),
+    );
+    eprintln!(
+        "pi_store new_check_point_split_begin caller={} log_path={:?} elapsed_ms={}",
+        caller,
+        logger.0.file.path(),
+        started.elapsed().as_millis(),
+    );
+    let log_index = match logger.0.file.split().await {
+        Ok(log_index) => {
+            eprintln!(
+                "pi_store new_check_point_split_end caller={} log_path={:?} log_index={} elapsed_ms={}",
+                caller,
+                logger.0.file.path(),
+                log_index,
+                started.elapsed().as_millis(),
+            );
+            log_index
+        },
+        Err(e) => {
+            eprintln!(
+                "pi_store new_check_point_split_err caller={} log_path={:?} elapsed_ms={} error={:?}",
+                caller,
+                logger.0.file.path(),
+                started.elapsed().as_millis(),
+                e,
+            );
+            return Err(e);
+        },
+    }; //立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
 
     //设置新的可写检查点
     let check_point_counter = Arc::new(AtomicU64::new(0)); //初始化可写检查点的计数器
@@ -890,6 +981,15 @@ async fn new_check_point(logger: &CommitLogger,
     //重置新的可写日志文件的已写入字节数量
     logger.0.writed_size.store(0, Ordering::Relaxed);
 
+    eprintln!(
+        "pi_store new_check_point_end caller={} log_path={:?} log_index={} writable_size={} only_reads_len={} elapsed_ms={}",
+        caller,
+        logger.0.file.path(),
+        log_index,
+        logger.0.file.writable_size(),
+        logger.0.only_reads.lock().len(),
+        started.elapsed().as_millis(),
+    );
     Ok(log_index)
 }
 
@@ -898,22 +998,55 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
     //等待指定时长后，开始整理提交日志记录器
     logger.0.rt.timeout(timeout).await;
 
-    if logger.0.is_replaying.load(Ordering::Relaxed) {
+    let started = Instant::now();
+    let is_replaying = logger.0.is_replaying.load(Ordering::Relaxed);
+    let writed_size = logger.0.writed_size.load(Ordering::Relaxed);
+    eprintln!(
+        "pi_store collect_timeout_wake log_path={:?} timeout_ms={} is_replaying={} writed_size={} log_file_limit={} writable_size={}",
+        logger.0.file.path(),
+        timeout,
+        is_replaying,
+        writed_size,
+        logger.0.log_file_limit,
+        logger.0.file.writable_size(),
+    );
+
+    if is_replaying {
         //如果提交日志记录器，当前正在重播，则忽略整理
         return;
     }
 
     //获取检查点表的异步锁
+    eprintln!(
+        "pi_store collect_check_points_lock_begin log_path={:?} writed_size={} log_file_limit={} elapsed_ms={}",
+        logger.0.file.path(),
+        logger.0.writed_size.load(Ordering::Relaxed),
+        logger.0.log_file_limit,
+        started.elapsed().as_millis(),
+    );
     let check_pointes_locked = logger.0.check_points.lock().await;
+    let will_new_check_point = logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit;
+    eprintln!(
+        "pi_store collect_check_points_lock_ok log_path={:?} check_points_len={} will_new_check_point={} wait_elapsed_ms={}",
+        logger.0.file.path(),
+        check_pointes_locked.len(),
+        will_new_check_point,
+        started.elapsed().as_millis(),
+    );
 
     //检查是否需要生成新的可写检查点
-    if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
+    if will_new_check_point {
         //提交日志的当前可写检查点对应的可写文件，已写入字节数量已达限制
         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-        new_check_point(&logger, false).await;
+        let _ = new_check_point(&logger, false, "collect").await;
     }
 
     drop(check_pointes_locked); //立即释放检查点表的异步锁
+    eprintln!(
+        "pi_store collect_check_points_scope_end log_path={:?} elapsed_ms={}",
+        logger.0.file.path(),
+        started.elapsed().as_millis(),
+    );
 }
 
 impl CommitLoggerExt for CommitLogger {
