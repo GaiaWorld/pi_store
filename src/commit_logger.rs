@@ -207,27 +207,78 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
+            let started = Instant::now();
+            let input_len = log.as_ref().len();
+            eprintln!(
+                "pi_store commit_append_enter commit_uid={:?} log_path={:?} input_len={} writable_size={} append_total={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                logger.0.file.writable_size(),
+                logger.0.commit_log_count.load(Ordering::Relaxed),
+            );
+
             if log.as_ref().len() == 0 {
                 //无效的提交日志，则忽略
+                eprintln!(
+                    "pi_store commit_append_inner_ok commit_uid={:?} log_path={:?} input_len=0 log_handle=0 elapsed_ms={}",
+                    commit_uid,
+                    logger.0.file.path(),
+                    started.elapsed().as_millis(),
+                );
                 return Ok(0);
             }
 
             let mut check_pointes_locked = logger.0.check_points.lock().await;
+            eprintln!(
+                "pi_store commit_append_lock_ok commit_uid={:?} log_path={:?} input_len={} check_points_len={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                check_pointes_locked.len(),
+                started.elapsed().as_millis(),
+            );
 
             //追加指定的提交日志
+            eprintln!(
+                "pi_store commit_append_inner_begin commit_uid={:?} log_path={:?} input_len={} writable_size={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                logger.0.file.writable_size(),
+                started.elapsed().as_millis(),
+            );
             let log_handle = logger.0.file.append(LogMethod::PlainAppend,
                                                   commit_uid.0.to_le_bytes().as_ref(),
                                                   log.as_ref());
+            eprintln!(
+                "pi_store commit_append_inner_ok commit_uid={:?} log_path={:?} input_len={} log_handle={} writable_size={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                log_handle,
+                logger.0.file.writable_size(),
+                started.elapsed().as_millis(),
+            );
 
             //增加已写入当前可写文件的字节数量
-            logger.0.writed_size.fetch_add(log.as_ref().len() as u64 + 16, Ordering::Relaxed);
+            logger.0.writed_size.fetch_add(input_len as u64 + 16, Ordering::Relaxed);
             //增加提交日志的数量
             logger.0.commit_log_count.fetch_add(1, Ordering::Relaxed);
 
             //注册本次事务到检查点表
             let (counter, path) = &*logger.0.writable.lock();
             counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
-            check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
+            check_pointes_locked.insert(commit_uid.clone(), (counter.clone(), path.clone()));
+            eprintln!(
+                "pi_store commit_append_done commit_uid={:?} log_path={:?} input_len={} log_handle={} check_points_len={} elapsed_ms={}",
+                commit_uid,
+                logger.0.file.path(),
+                input_len,
+                log_handle,
+                check_pointes_locked.len(),
+                started.elapsed().as_millis(),
+            );
 
             Ok(log_handle)
         }.boxed()
@@ -237,9 +288,41 @@ impl AsyncCommitLog for CommitLogger {
         let mut logger = self.clone();
 
         async move {
-            logger.0.file.delay_commit(log_handle,
-                                       false,
-                                       logger.0.delay_timeout).await
+            let started = Instant::now();
+            eprintln!(
+                "pi_store commit_flush_enter log_path={:?} log_handle={} delay_timeout={} commited_uid={} writable_size={}",
+                logger.0.file.path(),
+                log_handle,
+                logger.0.delay_timeout,
+                logger.0.file.commited_uid(),
+                logger.0.file.writable_size(),
+            );
+
+            let result = logger.0.file.delay_commit(log_handle,
+                                                    false,
+                                                    logger.0.delay_timeout).await;
+
+            match &result {
+                Ok(_) => eprintln!(
+                    "pi_store commit_flush_ok log_path={:?} log_handle={} commited_uid={} writable_size={} elapsed_ms={}",
+                    logger.0.file.path(),
+                    log_handle,
+                    logger.0.file.commited_uid(),
+                    logger.0.file.writable_size(),
+                    started.elapsed().as_millis(),
+                ),
+                Err(e) => eprintln!(
+                    "pi_store commit_flush_err log_path={:?} log_handle={} commited_uid={} writable_size={} elapsed_ms={} error={:?}",
+                    logger.0.file.path(),
+                    log_handle,
+                    logger.0.file.commited_uid(),
+                    logger.0.file.writable_size(),
+                    started.elapsed().as_millis(),
+                    e,
+                ),
+            }
+
+            result
         }.boxed()
     }
 

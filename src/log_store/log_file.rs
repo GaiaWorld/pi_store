@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::fmt::Debug;
 use std::fs::read_dir;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use std::mem::{drop, swap};
 use std::path::{Path, PathBuf};
 use std::collections::{LinkedList, VecDeque};
@@ -411,9 +411,37 @@ impl LogFile {
 
     //追加指定关键字的日志，返回日志id
     pub fn append(&self, method: LogMethod, key: &[u8], value: &[u8]) -> usize {
+        let started = Instant::now();
+        eprintln!(
+            "pi_store commit_append_log_file_lock_begin log_path={:?} method={:?} key_len={} value_len={} commited_uid={} writable_size={}",
+            self.0.path,
+            method,
+            key.len(),
+            value.len(),
+            self.0.commited_uid.load(Ordering::Relaxed),
+            self.0.writable_len.load(Ordering::Relaxed),
+        );
         let mut lock = self.0.current.lock();
+        eprintln!(
+            "pi_store commit_append_log_file_lock_ok log_path={:?} method={:?} key_len={} value_len={} current_uid={} elapsed_ms={}",
+            self.0.path,
+            method,
+            key.len(),
+            value.len(),
+            (*lock).1,
+            started.elapsed().as_millis(),
+        );
         (&mut *lock).0.as_mut().unwrap().append(method, key, value);
         (*lock).1 += 1;
+        eprintln!(
+            "pi_store commit_append_log_file_ok log_path={:?} method={:?} key_len={} value_len={} log_handle={} elapsed_ms={}",
+            self.0.path,
+            method,
+            key.len(),
+            value.len(),
+            (*lock).1,
+            started.elapsed().as_millis(),
+        );
         (*lock).1
     }
 }
