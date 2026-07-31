@@ -229,9 +229,12 @@ impl AsyncCommitLog for CommitLogger {
         let mut logger = self.clone();
 
         async move {
-            logger.0.file.delay_commit(log_handle,
-                                       false,
-                                       logger.0.delay_timeout).await
+            // CommitLogger 的 checkpoint 是事务到物理 WAL 文件的唯一所有权来源，文件轮换
+            // 必须统一由 new_check_point 在 check_points 锁内执行。底层 LogFile 的大小阈值
+            // 自动分裂在这里必须关闭，否则可能在上层发布新 checkpoint 前改变物理文件。
+            logger.0.file.delay_commit_without_auto_split(log_handle,
+                                                          false,
+                                                          logger.0.delay_timeout).await
         }.boxed()
     }
 
@@ -282,8 +285,11 @@ impl AsyncCommitLog for CommitLogger {
                                     Ok(meta) => {
                                         //获取只读检查点的元信息成功
                                         if meta.len() == 0 {
-                                            //当前只读检查点没有内容
-                                            *is_finish_confirm = true; //标记只读检查点的状态为已完成确认
+                                            // 零长度只读检查点没有登记过需要确认的事务，因此不会有
+                                            // commit_uid 能在未来单独推进它。必须将它视为已完成确认，
+                                            // 否则它会永久阻塞后继 WAL 转为 .bak；下面的队首顺序门禁
+                                            // 仍会阻止它和后继检查点越过更早的非空未确认 WAL。
+                                            *is_finish_confirm = true;
                                         }
                                     }
                                 }
@@ -529,11 +535,24 @@ impl AsyncCommitLog for CommitLogger {
     }
 }
 
-// 为提交日志文件，异步创建新的可写检查点
-// 设置上一个可写检查点是否已完成确认，并将上一个可写检查点追加到只读检查点的文件路径列表
+// 为提交日志文件异步创建新的可写检查点。
+//
+// 所有调用点都必须先持有 check_points 异步锁。该锁不仅保护事务到检查点的映射，还阻止
+// append 在“提交当前块 -> 分裂文件 -> 发布新检查点”之间注册新事务，因此这个维护序列对
+// CommitLogger 来说是原子的；锁内不持有 writable/only_reads 自旋锁跨 await。
+//
+// 当前块必须先成功落入当前映射对应的旧文件，才能切换 LogFile 的 writable。否则 append
+// 已登记到旧检查点、尚未 flush 的事务会在 split 后写入新文件，确认回收时可能把实际 WAL
+// 标记为 .bak，导致 repair/replay 忽略仍未完成持久化的事务。辅助提交失败时禁止 split，
+// 原检查点映射和 writable 均保持不变；但底层 commit 的既有 I/O 失败语义不会恢复已经交换
+// 出的内存块，磁盘、文件系统或 runtime 失败后的事务安全不属于本层保证，不能据此重试。
+//
+// commit_pending_block 自身通过独立任务完成内部指针归还和 waiter 唤醒；后续 split 仍沿用
+// LogFile 的既有取消边界。调用方不得在 split 的文件创建 await 中途取消 checkpoint future。
 async fn new_check_point(logger: &CommitLogger,
                          is_finish_confirm: bool) -> Result<usize> {
-    let log_index = logger.0.file.split().await?; //立即强制生成新的可写文件，并忽略强制生成新的可写文件是否成功
+    logger.0.file.commit_pending_block().await?;
+    let log_index = logger.0.file.split().await?; //当前块已落入旧检查点后，才允许生成新的可写文件
 
     //设置新的可写检查点
     let check_point_counter = Arc::new(AtomicU64::new(0)); //初始化可写检查点的计数器
@@ -819,6 +838,318 @@ impl<
     }
 }
 
+#[cfg(test)]
+mod checkpoint_rotation_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64 as TestAtomicU64, AtomicUsize as TestAtomicUsize},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use crossbeam_channel::bounded;
+    use pi_async_rt::rt::{
+        multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
+        startup_global_time_loop,
+        AsyncRuntime,
+    };
+
+    use super::*;
+
+    const PHYSICAL_FILE_LIMIT: usize = 1024 * 1024;
+    const CURRENT_BLOCK_LIMIT: usize = 2 * 1024 * 1024;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn test_commit_logger_checkpoint_crosses_logfile_limit_once() {
+        let _time_loop = startup_global_time_loop(1);
+        let rt = MultiTaskRuntimeBuilder::default()
+            .init_worker_size(1)
+            .build();
+        let root = unique_test_root();
+        fs::create_dir_all(&root)
+            .expect("creating checkpoint size-boundary test root must succeed");
+
+        let (sender, receiver) = bounded(1);
+        let test_rt = rt.clone();
+        let test_root = root.clone();
+        rt.spawn(async move {
+            let result = async {
+                verify_size_boundary(test_rt.clone(), test_root.join("commit-logger")).await?;
+                verify_public_delay_commit_boundary(test_rt, test_root.join("public-log-file")).await
+            }
+            .await;
+            let _ = sender.send(result);
+        })
+        .expect("spawning checkpoint size-boundary test must succeed");
+
+        receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("checkpoint size-boundary test must finish within 30 seconds")
+            .unwrap_or_else(|error| panic!("checkpoint size-boundary test failed: {error}"));
+        fs::remove_dir_all(&root)
+            .expect("cleaning checkpoint size-boundary test root must succeed");
+    }
+
+    async fn verify_size_boundary(
+        rt: MultiTaskRuntime<()>,
+        root: PathBuf,
+    ) -> std::result::Result<(), String> {
+        let logger = build_small_physical_file_logger(rt, root.clone()).await?;
+        let old_path = logger
+            .0
+            .file
+            .writable_path()
+            .ok_or_else(|| "small-limit logger omitted initial writable file".to_owned())?;
+        let first_uid = Guid(0x7101);
+        let second_uid = Guid(0x7102);
+
+        let first_handle = logger
+            .append(first_uid.clone(), vec![0x61; 768 * 1024])
+            .await
+            .map_err(|error| format!("appending first WAL failed: {error}"))?;
+        logger
+            .flush(first_handle)
+            .await
+            .map_err(|error| format!("flushing first WAL failed: {error}"))?;
+        let old_len_before = logger.0.file.writable_size();
+        if old_len_before == 0 || old_len_before >= PHYSICAL_FILE_LIMIT {
+            return Err(format!(
+                "first WAL must leave the physical file below its limit: len={old_len_before}, limit={PHYSICAL_FILE_LIMIT}",
+            ));
+        }
+        if logger.0.file.writable_path().as_ref() != Some(&old_path) {
+            return Err("CommitLogger flush must not auto-split the physical WAL".to_owned());
+        }
+
+        let crossing_payload_len = PHYSICAL_FILE_LIMIT - old_len_before + 64 * 1024;
+        let second_handle = logger
+            .append(second_uid.clone(), vec![0x71; crossing_payload_len])
+            .await
+            .map_err(|error| format!("appending threshold-crossing WAL failed: {error}"))?;
+        let new_checkpoint = logger
+            .append_check_point()
+            .await
+            .map_err(|error| format!("rotating threshold-crossing checkpoint failed: {error}"))?;
+        let new_path = logger
+            .0
+            .file
+            .writable_path()
+            .ok_or_else(|| "checkpoint rotation omitted new writable file".to_owned())?;
+
+        if new_path == old_path {
+            return Err("checkpoint rotation must replace the physical writable file".to_owned());
+        }
+        if logger.0.file.readable_amount() != 1 {
+            return Err(format!(
+                "threshold-crossing checkpoint must split exactly once: readable_amount={}",
+                logger.0.file.readable_amount(),
+            ));
+        }
+        let parsed_checkpoint = new_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(log_file_name_to_usize)
+            .ok_or_else(|| format!("new checkpoint path is invalid: {new_path:?}"))?;
+        if parsed_checkpoint != new_checkpoint {
+            return Err(format!(
+                "returned checkpoint must identify the actual writable file: returned={new_checkpoint}, actual={parsed_checkpoint}",
+            ));
+        }
+        let old_len_after = old_path
+            .metadata()
+            .map_err(|error| format!("reading old WAL metadata failed: {error}"))?
+            .len() as usize;
+        if old_len_after <= PHYSICAL_FILE_LIMIT {
+            return Err(format!(
+                "pending WAL must be written to the old file before its single split: len={old_len_after}",
+            ));
+        }
+        let new_len = new_path
+            .metadata()
+            .map_err(|error| format!("reading new WAL metadata failed: {error}"))?
+            .len();
+        if new_len != 0 {
+            return Err(format!(
+                "new checkpoint must not contain pre-rotation WAL: len={new_len}",
+            ));
+        }
+
+        logger
+            .flush(second_handle)
+            .await
+            .map_err(|error| format!("flushing helper-committed WAL failed: {error}"))?;
+        logger
+            .confirm(second_uid)
+            .await
+            .map_err(|error| format!("confirming second WAL failed: {error}"))?;
+        if !old_path.exists() {
+            return Err("old WAL must remain active until every registered transaction confirms".to_owned());
+        }
+        logger
+            .confirm(first_uid)
+            .await
+            .map_err(|error| format!("confirming first WAL failed: {error}"))?;
+
+        let mut backup_path = old_path.clone();
+        if !backup_path.set_extension("bak") {
+            return Err(format!("old WAL path cannot form a backup path: {old_path:?}"));
+        }
+        if old_path.exists() {
+            return Err("fully confirmed old WAL must no longer remain active".to_owned());
+        }
+        let backup_len = backup_path
+            .metadata()
+            .map_err(|error| format!("confirmed old WAL backup is missing: {error}"))?
+            .len() as usize;
+        if backup_len != old_len_after {
+            return Err(format!(
+                "confirmed backup must preserve the exact old WAL bytes: active={old_len_after}, backup={backup_len}",
+            ));
+        }
+        if logger.waiting_confirm_count().await != 0 ||
+            logger.append_total_count() != 2 ||
+            logger.confirm_total_count() != 2 {
+            return Err(format!(
+                "checkpoint accounting did not close: waiting={}, appended={}, confirmed={}",
+                logger.waiting_confirm_count().await,
+                logger.append_total_count(),
+                logger.confirm_total_count(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    // 生产修复只允许 CommitLogger 的私有 flush 关闭底层自动分裂；公开 LogFile 路径必须
+    // 保留原有物理阈值语义。同时，重复 flush 已提交句柄不得占住 delay owner，否则下一笔
+    // 未达块阈值的 WAL 只会登记 waiter，而旧句柄定时任务命中已提交快路后无人唤醒它。
+    async fn verify_public_delay_commit_boundary(
+        rt: MultiTaskRuntime<()>,
+        path: PathBuf,
+    ) -> std::result::Result<(), String> {
+        let file = LogFile::open(rt.clone(),
+                                 path,
+                                 CURRENT_BLOCK_LIMIT,
+                                 PHYSICAL_FILE_LIMIT,
+                                 None)
+            .await
+            .map_err(|error| format!("opening public LogFile boundary fixture failed: {error}"))?;
+        let old_path = file
+            .writable_path()
+            .ok_or_else(|| "public LogFile omitted initial writable path".to_owned())?;
+        let first_value = vec![0x81; PHYSICAL_FILE_LIMIT + 64 * 1024];
+        let first_handle = file.append(LogMethod::PlainAppend, b"first", &first_value);
+        if first_handle == 0 {
+            return Err("public LogFile append returned the reserved handle 0".to_owned());
+        }
+        file.delay_commit(first_handle, false, 1)
+            .await
+            .map_err(|error| format!("public threshold delay commit failed: {error}"))?;
+
+        // delay_commit 的 waiter 在 WAL 写入成功后、owner 完成自动 split 前被唤醒；这里按
+        // 公开既有语义只做有界观察，不能把返回值误当成文件切换的同步屏障。
+        let mut new_path = file
+            .writable_path()
+            .ok_or_else(|| "public threshold split omitted writable path".to_owned())?;
+        for _ in 0..100 {
+            if new_path != old_path && file.readable_amount() == 1 {
+                break;
+            }
+            rt.timeout(1).await;
+            new_path = file
+                .writable_path()
+                .ok_or_else(|| "public threshold split lost writable path".to_owned())?;
+        }
+        if new_path == old_path || file.readable_amount() != 1 {
+            return Err(format!(
+                "public delay commit must auto-split exactly once: old={old_path:?}, new={new_path:?}, readable={}",
+                file.readable_amount(),
+            ));
+        }
+        let old_len = old_path
+            .metadata()
+            .map_err(|error| format!("reading public old WAL metadata failed: {error}"))?
+            .len() as usize;
+        if old_len <= PHYSICAL_FILE_LIMIT || file.writable_size() != 0 {
+            return Err(format!(
+                "public auto-split file sizes are invalid: old={old_len}, new={}",
+                file.writable_size(),
+            ));
+        }
+
+        file.delay_commit(first_handle, false, 10)
+            .await
+            .map_err(|error| format!("repeating committed public handle failed: {error}"))?;
+        let second_handle = file.append(LogMethod::PlainAppend, b"second", b"value");
+        file.delay_commit(second_handle, false, 10)
+            .await
+            .map_err(|error| format!("public successor delay commit failed: {error}"))?;
+        if file.commited_uid() != second_handle || file.writable_path().as_ref() != Some(&new_path) {
+            return Err(format!(
+                "public successor did not close on the same writable file: committed={}, expected={}, writable={:?}, expected_path={new_path:?}",
+                file.commited_uid(),
+                second_handle,
+                file.writable_path(),
+            ));
+        }
+        if file.writable_size() == 0 || file.readable_amount() != 1 {
+            return Err(format!(
+                "public successor produced an unexpected split or empty write: writable_len={}, readable={}",
+                file.writable_size(),
+                file.readable_amount(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn build_small_physical_file_logger(
+        rt: MultiTaskRuntime<()>,
+        path: PathBuf,
+    ) -> std::result::Result<CommitLogger, String> {
+        let file = LogFile::open(rt.clone(),
+                                 path,
+                                 CURRENT_BLOCK_LIMIT,
+                                 PHYSICAL_FILE_LIMIT,
+                                 None)
+            .await
+            .map_err(|error| format!("opening small-limit LogFile failed: {error}"))?;
+        let check_point_path = Arc::new(
+            file.writable_path()
+                .ok_or_else(|| "small-limit LogFile omitted writable path".to_owned())?,
+        );
+        let check_point_counter = Arc::new(TestAtomicU64::new(0));
+
+        Ok(CommitLogger(Arc::new(InnerCommitLogger {
+            rt,
+            file,
+            delay_timeout: 1,
+            log_file_limit: u64::MAX,
+            writed_size: TestAtomicU64::new(0),
+            writable: SpinLock::new((check_point_counter, check_point_path)),
+            only_reads: SpinLock::new(VecDeque::new()),
+            check_points: Mutex::new(XHashMap::default()),
+            is_replaying: AtomicBool::new(false),
+            replay_only_reads: SpinLock::new(VecDeque::new()),
+            replay_confirm_buf: SpinLock::new(VecDeque::new()),
+            commit_log_count: TestAtomicUsize::new(0),
+            confirm_commited_count: TestAtomicUsize::new(0),
+        })))
+    }
+
+    fn unique_test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time must be after UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pi-store-checkpoint-size-boundary-{}-{nonce}",
+            std::process::id(),
+        ))
+    }
+}
+
 // 扩展的提交日志加载器
 struct CommitLoggerLoaderExt<
     B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
@@ -925,5 +1256,3 @@ impl<
         self.result
     }
 }
-
-

@@ -41,6 +41,15 @@ const DEFAULT_INIT_LOG_FILE_NUM: usize = 1;
 const DEFAULT_INIT_LOG_UID: usize = 0;
 
 /*
+* crate 内部“强制提交当前日志块”的保留日志id。
+*
+* LogFile::append 会先递增 DEFAULT_INIT_LOG_UID 再返回，因此合法日志句柄从1开始。0不会与
+* append 产生的句柄冲突，只用于要求 commit 跳过指定句柄已提交快路，并在 current 锁内取得
+* 本次实际提交块的最大日志id。该标记不得作为已提交日志id写入 commited_uid。
+*/
+const FORCE_COMMIT_CURRENT_LOG_UID: usize = DEFAULT_INIT_LOG_UID;
+
+/*
 * 日志块的标准长度，4KB
 */
 const LOG_BLOCK_MOD: usize = 4096;
@@ -740,16 +749,103 @@ impl LogFile {
         Ok(())
     }
 
-    //提交当前日志块，返回提交是否成功
+    // 在维护路径切换可写日志文件前，提交当前非空日志块。
+    //
+    // 该方法只供上层提交日志记录器维护检查点使用，不改变公开的 LogFile::split 语义：
+    // replay 等调用方仍可直接分裂已经落盘的日志文件。调用方必须先阻止新的上层日志注册，
+    // 保证当前块中的日志仍属于即将关闭的检查点。
+    //
+    // 这里只在短暂持有 current 自旋锁时读取“是否为空”和当前最大日志 id，锁内没有分配、
+    // await 或运行时派发。实际 commit 由独立运行时任务完整执行，这是因为 commit 会在文件
+    // 写入 await 期间临时取得 writable 指针的所有权；若维护调用方此时被取消，直接轮询
+    // commit future 可能跳过指针归还、等待者唤醒和 commited_uid 更新。独立任务即使失去
+    // 接收者也会继续完成这些内部收尾，调用方只等待该任务返回的原始写入结果。
+    pub(crate) async fn commit_pending_block(&self) -> Result<()> {
+        let log_uid = {
+            let current = self.0.current.lock();
+            match (&*current).0.as_ref() {
+                Some(block) if block.len() > 0 => (&*current).1,
+                _ => return Ok(()),
+            }
+        };
+
+        let (sender, receiver) = async_bounded(1);
+        let log = self.clone();
+        self.0.rt
+            .spawn(async move {
+                // 这里提交的是“轮换瞬间的当前块”，而不是再次等待某个普通句柄。使用保留
+                // 句柄可避免并发 flush 已推进 commited_uid 后错误命中旧句柄快路；commit
+                // 交换 current 后会把 log_uid 重置为块内真实最大值。checkpoint 会在本次
+                // 提交成功后自行显式 split，因此必须关闭 LogFile 的大小阈值自动分裂；否则
+                // 恰好跨过物理文件阈值时会连续分裂两次，并把中间空文件误登记为旧检查点。
+                let result = log
+                    .commit_inner(FORCE_COMMIT_CURRENT_LOG_UID,
+                                  true,
+                                  false,
+                                  None,
+                                  false)
+                    .await;
+                // 通道容量为 1 且只有一个结果；try_send 不会使已完成内部收尾的任务再次等待。
+                // 若维护调用方已被取消，接收端关闭只会丢弃返回值，不会取消上述 commit。
+                let _ = sender.try_send(result);
+            })
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "Commit pending log block failed, path: {:?}, pending_log_uid: {:?}, reason: spawn task failed, detail: {:?}",
+                        self.0.path,
+                        log_uid,
+                        e
+                    ),
+                )
+            })?;
+
+        match receiver.recv().await {
+            Ok(result) => result,
+            Err(e) => Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Commit pending log block failed, path: {:?}, pending_log_uid: {:?}, reason: result channel closed, detail: {:?}",
+                    self.0.path,
+                    log_uid,
+                    e
+                ),
+            )),
+        }
+    }
+
+    /// 提交当前日志块，返回提交是否成功。
+    ///
+    /// `log_uid` 的合法外部输入只能是本 `LogFile::append` 返回的非零句柄。0 被 crate 内部
+    /// 保留为“提交调用时 current 块”的控制标记，外部直接构造 0 不属于 API 合法调用域；
+    /// 该标记不会写入 `commited_uid`，交换 current 后始终改用块内真实最大日志 id。
     pub async fn commit(&self,
-                        mut log_uid: usize,
+                        log_uid: usize,
                         is_forcibly: bool,
                         is_split: bool,
                         timeout: Option<usize>) -> Result<()> {
+        self.commit_inner(log_uid,
+                          is_forcibly,
+                          is_split,
+                          timeout,
+                          true).await
+    }
+
+    // commit 的唯一内部实现。is_auto_split_enabled 只控制“达到物理文件大小软限制”分支，
+    // 不影响调用方显式传入的 is_split。公开 commit 始终启用原有自动分裂语义；只有已经由
+    // CommitLogger::new_check_point 保证随后显式 split 的维护提交会关闭它，避免双重分裂。
+    async fn commit_inner(&self,
+                          mut log_uid: usize,
+                          is_forcibly: bool,
+                          is_split: bool,
+                          timeout: Option<usize>,
+                          is_auto_split_enabled: bool) -> Result<()> {
         let mut commit_block = None;
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
 
-        if log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
+        let is_commit_current = is_forcibly && log_uid == FORCE_COMMIT_CURRENT_LOG_UID;
+        if !is_commit_current && log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
             //指定的日志已提交，则立即返回提交成功，也不需要唤醒任何的等待提交完成的任务
             return Ok(());
         }
@@ -759,7 +855,12 @@ impl LogFile {
             if !self.0.delay_commit.load(Ordering::Relaxed) {
                 //等待的当前延迟提交已完成，则继续等待下次延迟提交的返回
                 drop(mutex); //释放提交锁
-                return self.delay_commit(log_uid, is_split, timeout).await;
+                return self
+                    .delay_commit_inner(log_uid,
+                                        is_split,
+                                        timeout,
+                                        is_auto_split_enabled)
+                    .await;
             }
         }
 
@@ -853,7 +954,8 @@ impl LogFile {
                                                                 Ordering::Acquire,
                                                                 Ordering::Relaxed).is_ok() {
                             //当前没有整理，则检查是否需要创建新的可写日志文件
-                            if (self.0.writable_len.fetch_add(len, Ordering::Relaxed) + len >= self.0.size_limit) || is_split {
+                            let writable_len = self.0.writable_len.fetch_add(len, Ordering::Relaxed) + len;
+                            if (is_auto_split_enabled && writable_len >= self.0.size_limit) || is_split {
                                 //当前可写日志文件已达限制或需要强制分裂，则立即创建新的可写日志文件
                                 match append_writable(self.0.rt.clone(),
                                                       self.0.path.clone(),
@@ -899,20 +1001,57 @@ impl LogFile {
         Ok(())
     }
 
-    //延迟提交，返回延迟提交是否成功
+    /// 延迟提交，返回延迟提交是否成功。
+    ///
+    /// `log_uid` 必须来自本 `LogFile::append`；0 是 crate 内部保留值，外部不得直接传入。
+    /// 成功只表示目标 WAL 块已经写入并唤醒对应 waiter，不能作为物理文件自动分裂已经完成的
+    /// 可见性屏障：当定时 owner 负责写入时，waiter 会在 owner 继续完成阈值检查和文件切换前
+    /// 被唤醒。这是既有时序语义；需要观察文件拓扑的维护代码必须使用显式 `split` 的完成值。
     pub fn delay_commit(&self,
                         log_uid: usize,
                         is_split: bool,
                         timeout: usize) -> BoxFuture<Result<()>> {
+        self.delay_commit_inner(log_uid, is_split, timeout, true)
+    }
+
+    // CommitLogger 必须独占其 checkpoint 到物理文件的映射，不能允许 LogFile 在 flush
+    // 热路径中按自身大小阈值静默分裂。该入口只关闭底层自动分裂；显式 is_split 语义不变。
+    pub(crate) fn delay_commit_without_auto_split(&self,
+                                                  log_uid: usize,
+                                                  is_split: bool,
+                                                  timeout: usize) -> BoxFuture<Result<()>> {
+        self.delay_commit_inner(log_uid, is_split, timeout, false)
+    }
+
+    // delay_commit 的唯一内部实现。is_auto_split_enabled 必须沿 owner、waiter 和定时任务
+    // 完整传递，避免同一个延迟窗口中的不同分支采用不同的物理文件轮换策略。
+    fn delay_commit_inner(&self,
+                          log_uid: usize,
+                          is_split: bool,
+                          timeout: usize,
+                          is_auto_split_enabled: bool) -> BoxFuture<Result<()>> {
         let log = self.clone();
 
         async move {
+            if log_uid <= log.0.commited_uid.load(Ordering::Relaxed) {
+                // checkpoint 维护可能已经代替原 flush 提交了目标句柄。必须在抢占
+                // delay_commit owner 和派发定时任务之前短路，否则旧句柄任务会占住延迟窗口，
+                // 使随后追加的日志只登记 waiter 而没有能够刷新它的有效任务。
+                return Ok(());
+            }
+
             if log.0.delay_commit.compare_exchange(false,
                                                     true,
                                                     Ordering::Acquire,
                                                     Ordering::Relaxed).is_err() {
                 //已经有延迟提交，则立即返回失败
-                return log.commit(log_uid, false, is_split, Some(timeout)).await;
+                return log
+                    .commit_inner(log_uid,
+                                  false,
+                                  is_split,
+                                  Some(timeout),
+                                  is_auto_split_enabled)
+                    .await;
             }
 
             let rt = self.0.rt.clone();
@@ -920,11 +1059,32 @@ impl LogFile {
             let _ = self.0.rt.spawn(async move {
                 rt.timeout(timeout).await; //延迟指定时间
                 log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
-                if let Err(e) = log_copy.commit(log_uid, true, is_split, None).await {
+                // CommitLogger 的私有 no-auto-split 路径中，checkpoint 维护可能已推进原始
+                // log_uid，而延迟窗口内随后又有新日志；此时必须用保留句柄刷新到期时的
+                // current 并唤醒全部 waiter。公开 LogFile 路径仍使用原始句柄，保留其既有
+                // 已提交快路和 is_split 行为，不把上层 checkpoint 约束扩散到通用 API。
+                let timeout_log_uid = if is_auto_split_enabled {
+                    log_uid
+                } else {
+                    FORCE_COMMIT_CURRENT_LOG_UID
+                };
+                if let Err(e) = log_copy
+                    .commit_inner(timeout_log_uid,
+                                  true,
+                                  is_split,
+                                  None,
+                                  is_auto_split_enabled)
+                    .await {
                     error!("Delay commit failed, log_uid: {:?}, timeout: {:?}, reason: {:?}", log_uid, timeout, e);
                 }
             });
-            return log.commit(log_uid, false, is_split, Some(timeout)).await;
+            return log
+                .commit_inner(log_uid,
+                              false,
+                              is_split,
+                              Some(timeout),
+                              is_auto_split_enabled)
+                .await;
         }.boxed()
     }
 
