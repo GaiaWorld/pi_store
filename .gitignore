@@ -15,3 +15,5 @@ testdb
 /buddy_blocks1
 /benches/input.txt
 /redb
+/docs
+AGENTS.md

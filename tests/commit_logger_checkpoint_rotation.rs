@@ -8,18 +8,18 @@
 //! 非空 WAL 越过更早的非空未确认 WAL。
 
 use std::{
-    env,
-    fs,
-    future::{poll_fn, Future},
+    env, fs,
+    future::Future,
     panic,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
-    task::Poll,
+    task::{Context, Poll},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::bounded;
+use futures::task::noop_waker;
 use pi_async_rt::rt::{
     multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder},
     startup_global_time_loop, AsyncRuntime,
@@ -45,32 +45,27 @@ fn test_checkpoint_rotation_preserves_registered_wal_ownership() {
             .parse::<usize>()
             .expect("checkpoint rotation worker count must be a positive integer");
         let root = PathBuf::from(
-            env::var_os(ROOT_ENV)
-                .expect("checkpoint rotation child must receive its root path"),
+            env::var_os(ROOT_ENV).expect("checkpoint rotation child must receive its root path"),
         );
         run_on_runtime(workers, RUNTIME_TIMEOUT, move |rt| async move {
             verify_rotation_matrix(rt, root, workers).await
         })
         .unwrap_or_else(|error| {
-            panic!(
-                "checkpoint rotation matrix failed with {workers} workers: {error}",
-            )
+            panic!("checkpoint rotation matrix failed with {workers} workers: {error}",)
         });
         return;
     }
 
     for workers in [1usize, 4usize] {
         let root = unique_temp_root(workers);
-        fs::create_dir_all(&root)
-            .expect("creating checkpoint rotation evidence root must succeed");
+        fs::create_dir_all(&root).expect("creating checkpoint rotation evidence root must succeed");
         if let Err(error) = run_worker_process(workers, &root, PROCESS_TIMEOUT) {
             panic!(
                 "checkpoint rotation target failed with {workers} workers; evidence is preserved at {:?}: {error}",
                 root,
             );
         }
-        fs::remove_dir_all(&root)
-            .expect("cleaning checkpoint rotation evidence root must succeed");
+        fs::remove_dir_all(&root).expect("cleaning checkpoint rotation evidence root must succeed");
     }
 }
 
@@ -90,12 +85,7 @@ async fn verify_rotation_matrix(
     workers: usize,
 ) -> TestResult<()> {
     verify_empty_rotation(&rt, root.join("empty")).await?;
-    verify_flushed_rotation(
-        &rt,
-        root.join("flushed"),
-        Guid(0x1000 + workers as u128),
-    )
-    .await?;
+    verify_flushed_rotation(&rt, root.join("flushed"), Guid(0x1000 + workers as u128)).await?;
     verify_zero_length_checkpoint_does_not_block_confirmation(
         &rt,
         root.join("zero-length-middle"),
@@ -110,6 +100,20 @@ async fn verify_rotation_matrix(
         Guid(0x3000 + workers as u128),
     )
     .await?;
+    verify_size_owner_invalidates_old_timer(
+        &rt,
+        root.join("size-owner-invalidates-timer"),
+        Guid(0x3800 + workers as u128),
+        Guid(0x3900 + workers as u128),
+    )
+    .await?;
+    verify_cancelled_waiter_does_not_cancel_batch(
+        &rt,
+        root.join("cancelled-waiter"),
+        Guid(0x3a00 + workers as u128),
+        Guid(0x3b00 + workers as u128),
+    )
+    .await?;
     verify_existing_delay_owner_rotation(
         &rt,
         root.join("existing-delay-owner"),
@@ -119,11 +123,115 @@ async fn verify_rotation_matrix(
     .await
 }
 
-async fn verify_empty_rotation(
+/// 验证丢弃一个尚在等待的 flush Future 不会取消独立运行的定时提交所有者。
+///
+/// 第一个 flush 经单次轮询后已经创建真实定时任务并登记等待项，但尚未发生 I/O；随后丢弃
+/// 这个接收方，再让第二个事务作为活跃等待者加入同一批次。定时任务必须忽略第一个已关闭
+/// 接收端，继续写完整批次并唤醒第二个等待者。这里验证的是“等待阶段取消”，不把正在持有
+/// 底层裸文件指针执行 I/O 的所有者 Future 任意取消误写成安全合同。
+async fn verify_cancelled_waiter_does_not_cancel_batch(
     rt: &MultiTaskRuntime<()>,
     path: PathBuf,
+    cancelled_uid: Guid,
+    live_uid: Guid,
 ) -> TestResult<()> {
+    const DELAY_TIMEOUT_MS: usize = 10;
+
+    let logger = build_logger_with_delay(rt, &path, DELAY_TIMEOUT_MS).await?;
+    rt.timeout(1).await;
+    let cancelled_handle = logger
+        .append(cancelled_uid.clone(), vec![0xc1; 512])
+        .await
+        .map_err(|error| format!("appending cancelled-waiter WAL failed: {error}"))?;
+    let live_handle = logger
+        .append(live_uid.clone(), vec![0xc2; 512])
+        .await
+        .map_err(|error| format!("appending live-waiter WAL failed: {error}"))?;
+    let checkpoint = logger
+        .check_point_of(cancelled_uid.clone())
+        .await
+        .ok_or_else(|| "cancelled waiter omitted checkpoint registration".to_owned())?;
+    expect_eq(
+        "live waiter checkpoint registration",
+        logger.check_point_of(live_uid.clone()).await,
+        Some(checkpoint),
+    )?;
+
+    let mut cancelled_flush = logger.flush(cancelled_handle);
+    let first_poll = {
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        cancelled_flush.as_mut().poll(&mut context)
+    };
+    match first_poll {
+        Poll::Pending => {}
+        Poll::Ready(result) => {
+            return Err(format!(
+                "cancelled flush must first become a waiter, observed {result:?}",
+            ));
+        }
+    }
+    drop(cancelled_flush);
+    expect_state(
+        "cancelled waiter batch before timer",
+        checkpoint_file_state(&path, checkpoint)?,
+        CheckpointFileState::Active(0),
+    )?;
+
+    logger.flush(live_handle).await.map_err(|error| {
+        format!("live waiter was not completed after peer cancellation: {error}")
+    })?;
+    require_active_nonempty(
+        "timer owner must persist the batch after one receiver is cancelled",
+        checkpoint_file_state(&path, checkpoint)?,
+    )?;
+    logger
+        .confirm(live_uid)
+        .await
+        .map_err(|error| format!("confirming live waiter failed: {error}"))?;
+    logger
+        .confirm(cancelled_uid)
+        .await
+        .map_err(|error| format!("confirming cancelled waiter transaction failed: {error}"))?;
+    expect_eq(
+        "cancelled-waiter append count",
+        logger.append_total_count(),
+        2,
+    )?;
+    expect_eq(
+        "cancelled-waiter confirm count",
+        logger.confirm_total_count(),
+        2,
+    )?;
+    expect_eq(
+        "cancelled-waiter remaining registrations",
+        logger.waiting_confirm_count().await,
+        0,
+    )
+}
+
+async fn verify_empty_rotation(rt: &MultiTaskRuntime<()>, path: PathBuf) -> TestResult<()> {
     let logger = build_logger(rt, &path).await?;
+    let empty_uid = Guid(0xe001);
+    let empty_handle = logger
+        .append(empty_uid.clone(), Vec::<u8>::new())
+        .await
+        .map_err(|error| format!("appending empty WAL failed: {error}"))?;
+    expect_eq("empty WAL handle", empty_handle, 0)?;
+    expect_eq(
+        "empty WAL must not register a checkpoint",
+        logger.check_point_of(empty_uid.clone()).await,
+        None,
+    )?;
+    logger
+        .flush(empty_handle)
+        .await
+        .map_err(|error| format!("flushing empty WAL failed: {error}"))?;
+    logger
+        .confirm(empty_uid)
+        .await
+        .map_err(|error| format!("confirming ignored empty WAL failed: {error}"))?;
+
     let old_checkpoint = logger
         .current_check_point()
         .await
@@ -158,6 +266,115 @@ async fn verify_empty_rotation(
     )
 }
 
+/// 验证大小所有者（size owner）完成旧批次后，旧延迟定时器只能对原句柄做幂等检查。
+///
+/// 这个场景不触发检查点轮换：先用超过 2 KiB 块阈值的 WAL 让首次 `flush` 立即成为大小
+/// 所有者，再在它创建的延迟定时器到期前追加一个不足阈值的后继 WAL。v0.11.1 的句柄 0
+/// 特权会让旧定时器把后继 WAL 写入同一个物理文件；正确实现必须保持文件长度完全不变，
+/// 直到后继事务自己的 `flush` 到期。
+async fn verify_size_owner_invalidates_old_timer(
+    rt: &MultiTaskRuntime<()>,
+    path: PathBuf,
+    old_commit_uid: Guid,
+    new_commit_uid: Guid,
+) -> TestResult<()> {
+    const BLOCK_LIMIT: usize = 2 * 1024;
+    const DELAY_TIMEOUT_MS: usize = 10;
+    const OLD_TIMER_SETTLE_TICKS: usize = 3;
+
+    let logger = CommitLoggerBuilder::new(rt.clone(), &path)
+        .log_block_limit(BLOCK_LIMIT)
+        .delay_timeout(DELAY_TIMEOUT_MS)
+        .collect_interval(5 * 60 * 1000)
+        .build()
+        .await
+        .map_err(|error| format!("building size-owner logger at {path:?} failed: {error}"))?;
+
+    // 对齐到一次粗粒度时钟推进之后再创建旧定时器，使同步、后继 append 和定时器到期之间
+    // 留出接近一个完整 tick；被测延迟仍是生产 runtime 的真实定时任务。
+    rt.timeout(1).await;
+    let old_handle = logger
+        .append(old_commit_uid.clone(), vec![0xa1; BLOCK_LIMIT + 256])
+        .await
+        .map_err(|error| format!("appending size-owner WAL failed: {error}"))?;
+    let checkpoint = logger
+        .check_point_of(old_commit_uid.clone())
+        .await
+        .ok_or_else(|| "size-owner WAL omitted checkpoint registration".to_owned())?;
+    logger
+        .flush(old_handle)
+        .await
+        .map_err(|error| format!("size-owner flush failed: {error}"))?;
+    let size_owner_len = require_active_nonempty(
+        "size owner must synchronously persist its oversized block",
+        checkpoint_file_state(&path, checkpoint)?,
+    )?;
+
+    let new_handle = logger
+        .append(new_commit_uid.clone(), vec![0xb1; 512])
+        .await
+        .map_err(|error| format!("appending size-owner successor failed: {error}"))?;
+    if new_handle <= old_handle {
+        return Err(format!(
+            "size-owner append handles must increase: old={old_handle}, new={new_handle}",
+        ));
+    }
+    expect_eq(
+        "size-owner successor checkpoint registration",
+        logger.check_point_of(new_commit_uid.clone()).await,
+        Some(checkpoint),
+    )?;
+    expect_state(
+        "size-owner successor remains buffered before old timer",
+        checkpoint_file_state(&path, checkpoint)?,
+        CheckpointFileState::Active(size_owner_len),
+    )?;
+
+    for _ in 0..OLD_TIMER_SETTLE_TICKS {
+        rt.timeout(DELAY_TIMEOUT_MS + 1).await;
+    }
+    expect_state(
+        "expired size-owner timer must not persist successor WAL",
+        checkpoint_file_state(&path, checkpoint)?,
+        CheckpointFileState::Active(size_owner_len),
+    )?;
+
+    logger
+        .flush(new_handle)
+        .await
+        .map_err(|error| format!("successor's own flush failed: {error}"))?;
+    let final_len = require_active_nonempty(
+        "successor's own flush must eventually persist its WAL",
+        checkpoint_file_state(&path, checkpoint)?,
+    )?;
+    if final_len <= size_owner_len {
+        return Err(format!(
+            "successor flush did not grow the WAL: before={size_owner_len}, after={final_len}",
+        ));
+    }
+
+    logger
+        .confirm(new_commit_uid)
+        .await
+        .map_err(|error| format!("confirming size-owner successor first failed: {error}"))?;
+    logger
+        .confirm(old_commit_uid)
+        .await
+        .map_err(|error| format!("confirming size-owner predecessor failed: {error}"))?;
+    expect_eq("size-owner append count", logger.append_total_count(), 2)?;
+    expect_eq("size-owner confirm count", logger.confirm_total_count(), 2)?;
+    expect_eq(
+        "size-owner waiting count",
+        logger.waiting_confirm_count().await,
+        0,
+    )?;
+    require_backup_nonempty(
+        "fully confirmed size-owner checkpoint",
+        checkpoint_file_state(&path, checkpoint)?,
+    )?;
+    Ok(())
+}
+
 async fn verify_flushed_rotation(
     rt: &MultiTaskRuntime<()>,
     path: PathBuf,
@@ -169,7 +386,7 @@ async fn verify_flushed_rotation(
         .await
         .map_err(|error| format!("appending flushed transaction failed: {error}"))?;
     if handle == 0 {
-        return Err("LogFile append handle 0 is reserved for crate-internal control".to_owned());
+        return Err("non-empty LogFile append must return a nonzero handle".to_owned());
     }
     let old_checkpoint = logger
         .check_point_of(commit_uid.clone())
@@ -427,12 +644,12 @@ async fn verify_existing_delay_owner_rotation(
     new_commit_uid: Guid,
 ) -> TestResult<()> {
     const DELAY_TIMEOUT_MS: usize = 10;
-    const TIMER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    const OLD_TIMER_SETTLE_TICKS: usize = 3;
 
     let logger = build_logger_with_delay(rt, &path, DELAY_TIMEOUT_MS).await?;
-    // 本 target 的全局时钟以 1000ms 推进。先等待一个 tick，再立即建立 10ms timer，下一次
-    // 时钟推进前就有确定性的充足窗口完成 helper、split 和 successor append；这只控制测试
-    // 调度，不修改生产 delay_timeout 或 checkpoint 实现。
+    // 本测试目标的全局时钟以 1000 ms 推进。先等待一个时钟刻度（tick），再立即建立 10 ms
+    // 定时器，下一次时钟推进前就有确定性的充足窗口完成辅助提交、分裂和后继追加；这只控制
+    // 测试调度，不修改生产 delay_timeout 或检查点实现。
     rt.timeout(1).await;
     let old_handle = logger
         .append(old_commit_uid.clone(), vec![0x81; PAYLOAD_LEN])
@@ -444,19 +661,30 @@ async fn verify_existing_delay_owner_rotation(
     let old_checkpoint = logger
         .check_point_of(old_commit_uid.clone())
         .await
-        .ok_or_else(|| "existing-owner old transaction omitted checkpoint registration".to_owned())?;
+        .ok_or_else(|| {
+            "existing-owner old transaction omitted checkpoint registration".to_owned()
+        })?;
 
-    // 单次 poll 必须把旧 flush 推进到：已取得 delay owner、已派发定时任务、已登记 waiter。
-    // future 保持存活但暂不继续 poll，使后续 checkpoint helper 必须负责提交旧块并唤醒它。
+    // 单次 poll 必须把旧 flush 推进到：已取得延迟提交所有权（delay ownership）、已派发
+    // 定时任务、已登记等待者（waiter）。这里故意使用空操作唤醒器，而不是当前 runtime
+    // 任务的唤醒器。检查点随后会向等待者
+    // 通道发送结果；若遗留当前任务的旧唤醒器，它可能在本段单次探测已经结束后再次调度同一
+    // 外层 future，某些多 worker 运行时会因此并发 poll 同一任务。空操作唤醒器仍让真实
+    // async-channel receiver 完成登记，但发送方只更新通道状态；后面对 old_flush 的正常
+    // await 会重新 poll，并直接取得已就绪结果。
     let mut old_flush = logger.flush(old_handle);
-    let first_poll = poll_fn(|cx| Poll::Ready(old_flush.as_mut().poll(cx))).await;
+    let first_poll = {
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        old_flush.as_mut().poll(&mut context)
+    };
     match first_poll {
-        Poll::Pending => {},
+        Poll::Pending => {}
         Poll::Ready(result) => {
             return Err(format!(
                 "existing-owner old flush must be pending before rotation, observed {result:?}",
             ));
-        },
+        }
     }
     expect_state(
         "existing-owner old checkpoint before rotation",
@@ -501,26 +729,27 @@ async fn verify_existing_delay_owner_rotation(
         CheckpointFileState::Active(0),
     )?;
 
-    // checkpoint helper 已推进 old_handle。旧实现若仍用该句柄执行定时 commit，会命中
-    // committed 快路并遗留 successor waiter；保留句柄0必须让旧 timer 刷新届时的 current。
-    let deadline = Instant::now() + TIMER_OBSERVATION_TIMEOUT;
-    loop {
-        match checkpoint_file_state(&path, new_checkpoint)? {
-            CheckpointFileState::Active(len) if len > 0 => break,
-            CheckpointFileState::Active(0) if Instant::now() < deadline => {
-                rt.timeout(1).await;
-            },
-            observed => {
-                return Err(format!(
-                    "existing delay timer did not commit successor WAL before {TIMER_OBSERVATION_TIMEOUT:?}, observed {observed:?}",
-                ));
-            },
-        }
+    // 检查点辅助提交已经持久化到 old_handle，因此旧定时器所属的原批次已经结束。定时器
+    // 即使稍后才到期，也只能凭原始 old_handle 检查已提交水位并退出，绝不能把新检查点的
+    // 当前块（current）当作自己的批次强制同步。这里连续等待三个 1000 ms 全局时钟推进周期：
+    // 第一个周期使 10 ms 旧定时器到期，后两个周期给它充足机会取得提交锁并完整退出。测试使用
+    // 真实运行时、真实 CommitLogger、真实文件和真实同步写；粗粒度时钟只固定先后顺序，不替换
+    // 任何生产组件。
+    for _ in 0..OLD_TIMER_SETTLE_TICKS {
+        rt.timeout(DELAY_TIMEOUT_MS + 1).await;
     }
+    expect_state(
+        "expired predecessor timer must not commit successor checkpoint",
+        checkpoint_file_state(&path, new_checkpoint)?,
+        CheckpointFileState::Active(0),
+    )?;
+
+    // 由 successor 自己的合法 flush 负责最终活性。该调用既证明旧定时器无副作用不会导致
+    // 数据丢失，也证明恢复原始句柄约束后，新批次仍能由自己的定时窗口正常落盘。
     logger
         .flush(new_handle)
         .await
-        .map_err(|error| format!("flushing timer-committed successor failed: {error}"))?;
+        .map_err(|error| format!("flushing successor with its own delay window failed: {error}"))?;
 
     logger
         .confirm(new_commit_uid)
@@ -535,8 +764,16 @@ async fn verify_existing_delay_owner_rotation(
         .confirm(old_commit_uid)
         .await
         .map_err(|error| format!("confirming existing-owner predecessor failed: {error}"))?;
-    expect_eq("existing-owner append count", logger.append_total_count(), 2)?;
-    expect_eq("existing-owner confirm count", logger.confirm_total_count(), 2)?;
+    expect_eq(
+        "existing-owner append count",
+        logger.append_total_count(),
+        2,
+    )?;
+    expect_eq(
+        "existing-owner confirm count",
+        logger.confirm_total_count(),
+        2,
+    )?;
     expect_eq(
         "existing-owner waiting count",
         logger.waiting_confirm_count().await,
@@ -553,10 +790,7 @@ async fn verify_existing_delay_owner_rotation(
     Ok(())
 }
 
-async fn build_logger(
-    rt: &MultiTaskRuntime<()>,
-    path: &Path,
-) -> TestResult<CommitLogger> {
+async fn build_logger(rt: &MultiTaskRuntime<()>, path: &Path) -> TestResult<CommitLogger> {
     build_logger_with_delay(rt, path, 10).await
 }
 
@@ -580,10 +814,7 @@ enum CheckpointFileState {
     Missing,
 }
 
-fn checkpoint_file_state(
-    wal_path: &Path,
-    checkpoint: usize,
-) -> TestResult<CheckpointFileState> {
+fn checkpoint_file_state(wal_path: &Path, checkpoint: usize) -> TestResult<CheckpointFileState> {
     let active = wal_path.join(format!("{checkpoint:09}"));
     let backup = active.with_extension("bak");
     let active_exists = active.is_file();
@@ -606,10 +837,7 @@ fn checkpoint_file_state(
     Ok(CheckpointFileState::Missing)
 }
 
-fn require_active_nonempty(
-    label: &str,
-    state: CheckpointFileState,
-) -> TestResult<u64> {
+fn require_active_nonempty(label: &str, state: CheckpointFileState) -> TestResult<u64> {
     match state {
         CheckpointFileState::Active(len) if len > 0 => Ok(len),
         observed => Err(format!(
@@ -618,10 +846,7 @@ fn require_active_nonempty(
     }
 }
 
-fn require_backup_nonempty(
-    label: &str,
-    state: CheckpointFileState,
-) -> TestResult<u64> {
+fn require_backup_nonempty(label: &str, state: CheckpointFileState) -> TestResult<u64> {
     match state {
         CheckpointFileState::Backup(len) if len > 0 => Ok(len),
         observed => Err(format!(
@@ -652,11 +877,7 @@ fn expect_eq<T: std::fmt::Debug + PartialEq>(
     }
 }
 
-fn run_on_runtime<T, F, Fut>(
-    workers: usize,
-    timeout: Duration,
-    build: F,
-) -> TestResult<T>
+fn run_on_runtime<T, F, Fut>(workers: usize, timeout: Duration, build: F) -> TestResult<T>
 where
     T: Send + 'static,
     F: FnOnce(MultiTaskRuntime<()>) -> Fut,
@@ -679,11 +900,7 @@ where
         .map_err(|error| format!("checkpoint rotation target exceeded {timeout:?}: {error}"))?
 }
 
-fn run_worker_process(
-    workers: usize,
-    root: &Path,
-    timeout: Duration,
-) -> TestResult<()> {
+fn run_worker_process(workers: usize, root: &Path, timeout: Duration) -> TestResult<()> {
     let executable = env::current_exe()
         .map_err(|error| format!("locating checkpoint rotation executable failed: {error}"))?;
     let mut child = Command::new(executable)
@@ -712,7 +929,8 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> TestResult<ExitStatus
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|error| format!("checking checkpoint rotation child failed: {error}"))? {
+            .map_err(|error| format!("checking checkpoint rotation child failed: {error}"))?
+        {
             return Ok(status);
         }
         if Instant::now() >= deadline {

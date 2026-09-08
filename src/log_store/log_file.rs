@@ -1,3 +1,20 @@
+//! 分块追加、批量同步和物理文件轮换的日志文件实现。
+//!
+//! [`LogFile::append`] 只把编码后的日志写入共享的内存“当前日志块”，并返回单调递增的日志
+//! 唯一编号（log UID）；它本身不执行文件 I/O。[`LogFile::commit`] 和
+//! [`LogFile::delay_commit`] 以这个真实编号为批次边界，把包含目标编号的整块数据同步到当前
+//! 可写文件。一次块同步由首先取得提交权的所有者（owner）执行，其它调用作为等待者
+//! （waiter）共享同一结果。
+//!
+//! `commit_lock` 会覆盖同步文件 I/O、等待者通知以及可能的自动分裂，因此这些操作在单个
+//! `LogFile` 内严格串行。调用方不得把 `0` 或自行构造的整数当成“提交任意当前块”的控制命令；
+//! 合法持久化句柄必须来自同一个实例的 `append`。物理文件轮换与内存块提交是两个步骤：
+//! [`LogFile::split`] 只切换文件，不会自动提交尚在内存中的块。
+//!
+//! 本模块沿用历史裸指针文件句柄实现。提交 Future 在跨文件 I/O 等待时暂时取得该指针的
+//! 所有权，所以不能把“任意等待点均可取消”当作公开保证。需要取消安全维护边界的上层
+//! `CommitLogger` 会把内部提交放进自持有任务，再单独等待其结果。
+
 use std::sync::Arc;
 use std::fmt::Debug;
 use std::fs::read_dir;
@@ -39,15 +56,6 @@ const DEFAULT_INIT_LOG_FILE_NUM: usize = 1;
 * 默认的初始日志唯一id
 */
 const DEFAULT_INIT_LOG_UID: usize = 0;
-
-/*
-* crate 内部“强制提交当前日志块”的保留日志id。
-*
-* LogFile::append 会先递增 DEFAULT_INIT_LOG_UID 再返回，因此合法日志句柄从1开始。0不会与
-* append 产生的句柄冲突，只用于要求 commit 跳过指定句柄已提交快路，并在 current 锁内取得
-* 本次实际提交块的最大日志id。该标记不得作为已提交日志id写入 commited_uid。
-*/
-const FORCE_COMMIT_CURRENT_LOG_UID: usize = DEFAULT_INIT_LOG_UID;
 
 /*
 * 日志块的标准长度，4KB
@@ -356,12 +364,18 @@ fn write_header(buf: &mut Vec<u8>, mut hasher: Hasher, len: usize) {
     buf.put_u32_le(len as u32);
 }
 
-/*
-* 日志文件
-*/
+/// 可克隆、共享的分块日志文件句柄。
+///
+/// 所有克隆指向同一内存日志块、同一可写文件和同一提交锁。`append` 是内存操作；提交、
+/// 分裂和整理可能等待运行时任务及文件 I/O。该类型不提供显式关闭方法；历史裸指针存储也
+/// 没有把 `drop(LogFile)` 定义为同步落盘或资源回收屏障，调用方不能依赖丢弃句柄完成这两件事。
 #[derive(Clone)]
 pub struct LogFile(Arc<InnerLogFile>);
 
+// SAFETY: 这是历史实现依赖的线程安全不变量：跨线程写操作必须通过原子变量、`SpinLock`、
+// `commit_lock` 与 `mutex_status` 串行，`writable`/`readable` 裸指针在访问期间必须保持有效且
+// 不得与替换操作竞态。本次定时器修复不改变这些字段、锁范围或 unsafe 控制流。裸指针公开
+// 读取与文件轮换的更宽并发组合仍是既有审计边界，不能仅凭这个声明推导为任意组合均安全。
 unsafe impl Send for LogFile {}
 unsafe impl Sync for LogFile {}
 
@@ -418,7 +432,11 @@ impl LogFile {
         self.0.commited_uid.load(Ordering::Relaxed)
     }
 
-    //追加指定关键字的日志，返回日志id
+    /// 把一条日志追加到内存中的当前块，并返回其日志唯一编号（log UID）。
+    ///
+    /// 返回值从 `1` 开始单调递增；`0` 不会由本方法返回。成功只表示字节已经进入内存块，
+    /// 不表示已经写入或同步到磁盘。返回句柄只能交回同一个 `LogFile` 的 `commit` 或
+    /// `delay_commit`，跨实例使用或自行构造编号不属于合法调用协议。
     pub fn append(&self, method: LogMethod, key: &[u8], value: &[u8]) -> usize {
         let mut lock = self.0.current.lock();
         (&mut *lock).0.as_mut().unwrap().append(method, key, value);
@@ -431,7 +449,16 @@ impl LogFile {
 * 日志文件异步方法
 */
 impl LogFile {
-    //打开指定本地路径的日志文件
+    /// 打开或创建指定目录中的日志文件集合。
+    ///
+    /// `block_size_limit` 是一次内存批量提交的软阈值，合法范围为 32 B 到 2 GiB；越界时
+    /// 回退为 8000 B。`log_size_limit` 是公开提交路径触发自动文件分裂的软阈值，合法范围为
+    /// 1 MiB 到 16 GiB；越界时回退为 16 MiB。目录为空时，`log_file_index` 决定首个物理
+    /// 文件编号，`None` 使用 `1`；目录已有日志时该参数不参与选择。
+    ///
+    /// 本方法会执行目录和文件 I/O，失败返回 [`std::io::Error`]。打开已有文件只恢复物理
+    /// 文件及长度，进程内日志唯一编号和已提交水位仍从 `0` 开始；恢复业务记录应使用加载或
+    /// 上层重播流程，不能把这些进程内编号当成跨重启标识。
     pub async fn open<P: AsRef<Path> + Debug>(rt: MultiTaskRuntime<()>,
                                               path: P,
                                               mut block_size_limit: usize,
@@ -773,13 +800,17 @@ impl LogFile {
         let log = self.clone();
         self.0.rt
             .spawn(async move {
-                // 这里提交的是“轮换瞬间的当前块”，而不是再次等待某个普通句柄。使用保留
-                // 句柄可避免并发 flush 已推进 commited_uid 后错误命中旧句柄快路；commit
-                // 交换 current 后会把 log_uid 重置为块内真实最大值。checkpoint 会在本次
-                // 提交成功后自行显式 split，因此必须关闭 LogFile 的大小阈值自动分裂；否则
-                // 恰好跨过物理文件阈值时会连续分裂两次，并把中间空文件误登记为旧检查点。
+                // 这里必须携带采样到的真实最大日志 id。调用方持有 check_points 锁，期间
+                // CommitLogger::append 无法产生更新的日志；如果另一个提交者已经同步到该 id，
+                // commit_inner 的已提交水位快路即可安全返回，此时不会遗漏属于旧检查点的新块。
+                // 不能使用 0 绕过水位检查：没有批次身份的旧定时器曾因此取得后继 current，
+                // 把本应继续聚合的后继日志提前同步，显著增加物理同步次数和全局锁排队。
+                //
+                // checkpoint 会在本次提交成功后自行显式 split，因此必须关闭 LogFile 的大小
+                // 阈值自动分裂；否则恰好跨过物理文件阈值时会连续分裂两次，并把中间空文件
+                // 误登记为旧检查点。
                 let result = log
-                    .commit_inner(FORCE_COMMIT_CURRENT_LOG_UID,
+                    .commit_inner(log_uid,
                                   true,
                                   false,
                                   None,
@@ -815,11 +846,26 @@ impl LogFile {
         }
     }
 
-    /// 提交当前日志块，返回提交是否成功。
+    /// 提交包含 `log_uid` 的当前日志批次。
     ///
-    /// `log_uid` 的合法外部输入只能是本 `LogFile::append` 返回的非零句柄。0 被 crate 内部
-    /// 保留为“提交调用时 current 块”的控制标记，外部直接构造 0 不属于 API 合法调用域；
-    /// 该标记不会写入 `commited_uid`，交换 current 后始终改用块内真实最大日志 id。
+    /// `log_uid` 的合法持久化目标是本 `LogFile::append` 返回的非零句柄；它既标识调用方等待
+    /// 的日志，也限制强制提交只能作用于尚未覆盖该句柄的批次。`is_forcibly` 只跳过块大小
+    /// 判断，不跳过 `log_uid <= commited_uid` 的已提交水位判断。因此重复提交已经完成的真实
+    /// 句柄是幂等空操作，不会交换或同步后来形成的当前块。直接构造 `0` 或未来句柄没有由
+    /// `append` 建立的持久化目标，不属于正常调用协议；其中 `0` 会命中初始已提交水位并
+    /// 直接成功返回，绝不是“提交调用时任意当前块”的特殊命令。
+    ///
+    /// - `is_forcibly=false` 时，仅当当前块达到大小阈值才由本调用提交；否则本调用登记为
+    ///   等待者。没有定时所有者或其它大小所有者时，单独等待这种调用可能不会完成。
+    /// - `is_forcibly=true` 时跳过块大小判断，但仍受上述真实句柄水位约束。
+    /// - `is_split=true` 只在本调用实际成为提交所有者并成功写入后请求文件分裂；若句柄早已
+    ///   提交，入口幂等返回，不会为了该标志额外分裂。
+    /// - `timeout=Some(ms)` 用于加入或重新建立延迟提交窗口；常规调用应优先使用
+    ///   [`LogFile::delay_commit`]。
+    ///
+    /// 方法可能等待全局提交锁和同步文件 I/O。同步失败会返回 `ErrorKind::Other` 并把等候同批
+    /// 结果的等待者全部唤醒为错误；历史实现不会把已经交换出的内存块放回。由于文件裸指针在
+    /// I/O 等待期间由该 Future 临时持有，不能假定任意等待点取消都是安全的。
     pub async fn commit(&self,
                         log_uid: usize,
                         is_forcibly: bool,
@@ -835,6 +881,9 @@ impl LogFile {
     // commit 的唯一内部实现。is_auto_split_enabled 只控制“达到物理文件大小软限制”分支，
     // 不影响调用方显式传入的 is_split。公开 commit 始终启用原有自动分裂语义；只有已经由
     // CommitLogger::new_check_point 保证随后显式 split 的维护提交会关闭它，避免双重分裂。
+    // 该函数持有 commit_lock 跨同步 I/O，因此首先取得锁且真正交换块的调用是提交所有者
+    // （owner），其它低于阈值的调用登记为等待者（waiter）。这是既有队头阻塞边界，本轮仅
+    // 阻止过期定时器产生额外同步，不改变锁范围。
     async fn commit_inner(&self,
                           mut log_uid: usize,
                           is_forcibly: bool,
@@ -844,8 +893,7 @@ impl LogFile {
         let mut commit_block = None;
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
 
-        let is_commit_current = is_forcibly && log_uid == FORCE_COMMIT_CURRENT_LOG_UID;
-        if !is_commit_current && log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
+        if log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
             //指定的日志已提交，则立即返回提交成功，也不需要唤醒任何的等待提交完成的任务
             return Ok(());
         }
@@ -1001,12 +1049,19 @@ impl LogFile {
         Ok(())
     }
 
-    /// 延迟提交，返回延迟提交是否成功。
+    /// 在大小阈值或延迟时限先到达时，提交包含 `log_uid` 的批次。
     ///
-    /// `log_uid` 必须来自本 `LogFile::append`；0 是 crate 内部保留值，外部不得直接传入。
-    /// 成功只表示目标 WAL 块已经写入并唤醒对应 waiter，不能作为物理文件自动分裂已经完成的
-    /// 可见性屏障：当定时 owner 负责写入时，waiter 会在 owner 继续完成阈值检查和文件切换前
-    /// 被唤醒。这是既有时序语义；需要观察文件拓扑的维护代码必须使用显式 `split` 的完成值。
+    /// `log_uid` 必须来自同一个 [`LogFile::append`]；`0` 或伪造编号没有持久化目标，不属于
+    /// 正常调用协议。第一个有效调用取得延迟提交所有权（delay ownership）并创建定时任务；
+    /// 同一窗口中的其它调用成为等待者，除非当前块已经达到阈值并由其立即提交。定时任务始终
+    /// 携带创建窗口时的原始编号：若该编号已由大小所有者或检查点辅助提交完成，它只按已提交
+    /// 水位幂等退出，不得同步后来形成的批次。
+    ///
+    /// `timeout` 的单位为毫秒。成功只表示目标 WAL 块已经写入并唤醒对应等待者，不能作为物理
+    /// 文件自动分裂已经完成的可见性屏障：当定时所有者（timer owner）负责写入时，等待者会
+    /// 在所有者继续完成阈值检查和文件切换前被唤醒。这是既有时序语义；需要观察文件拓扑的
+    /// 维护代码必须等待显式 [`LogFile::split`] 的完成值。`is_split` 的其它边界与 `commit`
+    /// 相同。
     pub fn delay_commit(&self,
                         log_uid: usize,
                         is_split: bool,
@@ -1023,8 +1078,9 @@ impl LogFile {
         self.delay_commit_inner(log_uid, is_split, timeout, false)
     }
 
-    // delay_commit 的唯一内部实现。is_auto_split_enabled 必须沿 owner、waiter 和定时任务
-    // 完整传递，避免同一个延迟窗口中的不同分支采用不同的物理文件轮换策略。
+    // delay_commit 的唯一内部实现。is_auto_split_enabled 必须沿所有者（owner）、等待者
+    // （waiter）和定时任务完整传递，避免同一个延迟窗口中的不同分支采用不同的物理文件
+    // 轮换策略。
     fn delay_commit_inner(&self,
                           log_uid: usize,
                           is_split: bool,
@@ -1034,9 +1090,9 @@ impl LogFile {
 
         async move {
             if log_uid <= log.0.commited_uid.load(Ordering::Relaxed) {
-                // checkpoint 维护可能已经代替原 flush 提交了目标句柄。必须在抢占
-                // delay_commit owner 和派发定时任务之前短路，否则旧句柄任务会占住延迟窗口，
-                // 使随后追加的日志只登记 waiter 而没有能够刷新它的有效任务。
+                // checkpoint 维护可能已经代替原 flush 提交了目标句柄。必须在抢占延迟提交
+                // 所有权（delay ownership）和派发定时任务之前短路，否则旧句柄任务会占住
+                // 延迟窗口，使随后追加的日志只登记等待者（waiter），却没有能够刷新它的有效任务。
                 return Ok(());
             }
 
@@ -1059,17 +1115,15 @@ impl LogFile {
             let _ = self.0.rt.spawn(async move {
                 rt.timeout(timeout).await; //延迟指定时间
                 log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
-                // CommitLogger 的私有 no-auto-split 路径中，checkpoint 维护可能已推进原始
-                // log_uid，而延迟窗口内随后又有新日志；此时必须用保留句柄刷新到期时的
-                // current 并唤醒全部 waiter。公开 LogFile 路径仍使用原始句柄，保留其既有
-                // 已提交快路和 is_split 行为，不把上层 checkpoint 约束扩散到通用 API。
-                let timeout_log_uid = if is_auto_split_enabled {
-                    log_uid
-                } else {
-                    FORCE_COMMIT_CURRENT_LOG_UID
-                };
+                // 定时器只能代表创建它的原始 log_uid 批次。若大小提交或 checkpoint 辅助
+                // 提交已经把水位推进到该 id，下面的 commit_inner 必须在交换 current 前
+                // 幂等退出，不能把后继批次当作旧定时器的工作。反之，原始 id 尚未提交时，
+                // 强制提交仍会交换包含它的当前块，保证低流量场景最终落盘。
+                //
+                // is_auto_split_enabled 只决定本次成功写入后能否按物理文件大小自动分裂，
+                // 不改变定时器的批次身份、等待者唤醒、显式 is_split 或错误传播语义。
                 if let Err(e) = log_copy
-                    .commit_inner(timeout_log_uid,
+                    .commit_inner(log_uid,
                                   true,
                                   is_split,
                                   None,
@@ -1088,7 +1142,16 @@ impl LogFile {
         }.boxed()
     }
 
-    //立即分裂当前的日志文件
+    /// 创建并切换到下一个可写日志文件，返回新文件的编号。
+    ///
+    /// 本方法不会提交内存中的当前日志块。若上层要求“轮换前追加的数据属于旧文件”，必须先
+    /// 成功提交该块，并在两个步骤之间阻止新的追加；`CommitLogger` 通过检查点锁和私有辅助
+    /// 提交完成这一约束。成功后旧可写路径进入只读路径列表，新文件为空。
+    ///
+    /// 文件创建失败会返回 `ErrorKind::Other`，但由于编号在创建前领取，失败的编号会被消耗；
+    /// 后续成功分裂可能出现物理编号跳跃。与整理冲突时返回 `ErrorKind::WouldBlock`。本方法在
+    /// 异步创建文件期间保持内部互斥状态，调用方不得在该等待点任意取消，否则不能假定互斥
+    /// 状态会自动回滚。
     pub async fn split(&self) -> Result<usize> {
         let mut _mutex = self.0.commit_lock.lock().await; //获取提交锁
 
@@ -1129,7 +1192,11 @@ impl LogFile {
         }
     }
 
-    /// 获取当前日志编号
+    /// 获取下一次创建物理日志文件时将领取的编号。
+    ///
+    /// 该值不是当前可写文件的编号：正常打开编号 `N` 的当前文件后，本方法返回 `N + 1`；
+    /// `split` 成功返回领取到的 `N + 1`，随后本方法通常变为 `N + 2`。分裂创建失败也会消耗
+    /// 已领取的编号。
     pub fn current_log_index(&self) -> usize {
         self.0.log_id.load(Ordering::Relaxed)
     }
@@ -2588,5 +2655,7 @@ struct InnerLogFile {
     mutex_status:       AtomicBool,                                     //日志文件是否正在执行互斥操作，例如日志整理或创建新的可写日志文件是互斥操作
 }
 
+// SAFETY: 与 LogFile 的历史手工 Send/Sync 边界相同；所有调用点必须维持上方列出的锁与裸指针
+// 有效性不变量。本次修复只改变传入提交路径的日志编号，不改变 InnerLogFile 的共享状态布局。
 unsafe impl Send for InnerLogFile {}
 unsafe impl Sync for InnerLogFile {}

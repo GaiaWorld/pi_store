@@ -1,3 +1,14 @@
+//! 基于文件的事务提交日志（commit log）与检查点管理。
+//!
+//! 正常调用链是 `append -> flush -> 发布业务状态 -> confirm`：`append` 同时把事务登记到
+//! 当前检查点，`flush` 等待预写日志（write-ahead log，WAL）同步，`confirm` 只在事务已经
+//! 不再需要该 WAL 恢复时撤销登记。检查点轮换必须在同一把 `check_points` 锁内完成“提交旧
+//! 内存块、切换物理文件、发布新检查点”，从而保证登记归属和实际文件归属一致。
+//!
+//! 底层 [`LogFile`] 仍支持按物理文件大小自动分裂，但本模块的普通 `flush` 会关闭该能力；
+//! `CommitLogger` 是其检查点文件边界的唯一发布者。延迟提交仍使用 `LogFile::append` 返回的
+//! 真实日志编号，过期定时器只能检查自己原批次是否完成，不能强制同步后继批次。
+
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -48,20 +59,24 @@ const DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT: u64 = 32 * 1024 * 1024;
 ///
 const DEFAULT_COMMIT_LOG_COLLECT_INTERVAL: usize = 10 * 1000;
 
-///
-/// 基于日志文件的提交日志记录器的扩展
-///
+/// 带日志方法和块同步时间的提交日志重播扩展。
 pub trait CommitLoggerExt: AsyncCommitLog {
-    /// 开始重播提交日志，回调时传递事务唯一ID，块同步时间和负载，返回重播的日志数量和字节数量
+    /// 开始重播，逐条回调事务唯一编号、日志方法、块同步时间和负载。
+    ///
+    /// `Some(...)` 表示一条重播记录，最终的 `None` 表示输入结束。成功返回重播记录数及按本
+    /// 模块口径统计的字节数。回调同步执行；记录回调的错误会被包装为 `ErrorKind::Other` 返回，
+    /// 结束标记 `None` 的回调返回值按历史语义被忽略。无论成功、空日志还是回调失败，调用方仍
+    /// 必须按 [`AsyncCommitLog::finish_replay`] 的协议显式结束重播状态。
     fn start_replay_ext<B, F>(&self, callback: Arc<F>)
         -> BoxFuture<'static, Result<(usize, usize)>>
     where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
           F: Fn(Option<(Self::Cid, LogMethod, u64, B)>) -> Result<()> + Send + Sync + 'static;
 }
 
+/// [`CommitLogger`] 的配置构建器。
 ///
-/// 基于日志文件的提交日志记录器的构建器
-///
+/// 配置方法消费并返回构建器。越界数值不会报错或截断到最近边界，而是恢复为对应默认值；
+/// 只有 [`CommitLoggerBuilder::build`] 执行目录和文件 I/O。
 pub struct CommitLoggerBuilder {
     rt:                 MultiTaskRuntime<()>,   //异步运行时
     path:               PathBuf,                //提交日志记录器的日志文件所在路径
@@ -71,11 +86,16 @@ pub struct CommitLoggerBuilder {
     collect_interval:   usize,                  //提交日志记录器的定时整理间隔时长，单位毫秒
 }
 
+// SAFETY: 构建器只持有可跨线程共享的运行时句柄、路径和整数配置，且构建前没有内部后台任务
+// 或别名可变引用。保留历史显式实现，避免在本次 WAL 语义修复中改变类型边界。
 unsafe impl Send for CommitLoggerBuilder {}
 unsafe impl Sync for CommitLoggerBuilder {}
 
 impl CommitLoggerBuilder {
-    /// 构建一个基于日志文件的提交日志记录器的构建器
+    /// 使用给定多线程运行时和 WAL 目录创建默认配置。
+    ///
+    /// 本方法不访问文件系统。默认块阈值为 8 KiB，延迟提交时限为 1 ms，上层检查点文件软
+    /// 限制为 32 MiB，后台整理间隔为 10 s。
     pub fn new<P: AsRef<Path>>(rt: MultiTaskRuntime<()>,
                                dir: P) -> Self {
         CommitLoggerBuilder {
@@ -88,7 +108,10 @@ impl CommitLoggerBuilder {
         }
     }
 
-    /// 设置提交日志文件的块大小限制，超过限制以后，会强制刷新可写文件
+    /// 设置内存日志块的批量提交软阈值，单位为字节。
+    ///
+    /// 合法闭区间为 2 KiB 到 32 MiB；越界值恢复为默认 8 KiB。达到或超过阈值的刷新调用
+    /// 可以成为大小提交所有者（size owner），同步整个当前块。
     pub fn log_block_limit(mut self, mut limit: usize) -> Self {
         if limit < 2048 || limit > 32 * 1024 * 1024 {
             limit = DEFAULT_COMMIT_LOG_BLOCK_SIZE
@@ -98,7 +121,10 @@ impl CommitLoggerBuilder {
         self
     }
 
-    /// 设置提交日志文件的超时时长，提交日志文件在超时后，会强制刷新可写文件
+    /// 设置低流量批次的延迟提交时限，单位为毫秒。
+    ///
+    /// 合法闭区间为 1 到 10 ms；越界值恢复为默认 1 ms。它是运行时定时器的软时限，任务
+    /// 调度和全局提交锁排队可能使实际完成时间更晚。
     pub fn delay_timeout(mut self, mut timeout: usize) -> Self {
         if timeout < 1 || timeout > 10 {
             timeout = DEFAULT_DELAY_COMMIT_TIMEOUT
@@ -108,7 +134,10 @@ impl CommitLoggerBuilder {
         self
     }
 
-    /// 设置提交日志文件的大小限制，超过限制以后，会强制生成新的可写文件
+    /// 设置 `CommitLogger` 检查点文件的轮换软阈值，单位为字节。
+    ///
+    /// 合法闭区间为 2 MiB 到 2 GiB；越界值恢复为默认 32 MiB。追加跨过阈值不会在热路径
+    /// 立即切换文件；确认操作或后台整理观察到阈值后，才在检查点锁内执行受控轮换。
     pub fn log_file_limit(mut self, mut limit: u64) -> Self {
         if limit < 2 * 1024 * 1024 || limit > 2 * 1024 * 1024 * 1024 {
             limit = DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT;
@@ -118,7 +147,9 @@ impl CommitLoggerBuilder {
         self
     }
 
-    /// 设置提交日志记录器的定时整理的间隔时长
+    /// 设置后台检查点整理循环的间隔，单位为毫秒。
+    ///
+    /// 合法闭区间为 5 s 到 5 min；越界值恢复为默认 10 s。
     pub fn collect_interval(mut self, mut interval: usize) -> Self {
         if interval < 5 * 1000 || interval > 5 * 60 * 1000 {
             interval = DEFAULT_COMMIT_LOG_COLLECT_INTERVAL;
@@ -128,7 +159,10 @@ impl CommitLoggerBuilder {
         self
     }
 
-    /// 异步构建一个基于日志文件的提交日志记录器
+    /// 打开 WAL 目录、初始化检查点状态并启动后台整理任务。
+    ///
+    /// 构建失败返回文件系统或日志打开错误。成功后，所有 `CommitLogger` 克隆共享同一状态；
+    /// 后台整理任务也持有一个克隆并按配置持续运行，当前 API 没有显式关闭接口。
     pub async fn build(mut self) -> Result<CommitLogger> {
         let file = LogFile::open(self.rt.clone(),
                                  self.path.clone(),
@@ -181,12 +215,20 @@ impl CommitLoggerBuilder {
     }
 }
 
+/// 基于 [`LogFile`] 的可克隆事务提交日志记录器。
 ///
-/// 基于日志文件的提交日志记录器
+/// 该类型实现 [`AsyncCommitLog`]。非空 `append` 返回的句柄必须先交给 `flush`；只有成功返回
+/// 才能把依赖该 WAL 的业务状态视为可发布。业务提交不再需要恢复后，应以同一个事务唯一编号
+/// 调用 `confirm`。空负载被忽略并返回句柄 `0`，对应 `flush(0)` 是无 I/O 的成功空操作。
 ///
+/// `append`、检查点轮换和确认会竞争检查点异步锁；`flush` 进一步受底层全局提交锁串行化，
+/// 可能等待批量同步 I/O。重播期间的确认会先缓冲，直到显式完成重播。重复确认或未知事务编号
+/// 保持无操作成功语义。
 #[derive(Clone)]
 pub struct CommitLogger(Arc<InnerCommitLogger>);
 
+// SAFETY: 所有克隆通过 Arc 共享状态；事务到检查点的映射由异步锁保护，短状态由自旋锁或原子
+// 变量保护，文件提交委托给 LogFile 的串行化边界。本次修复没有新增或改变 unsafe 状态。
 unsafe impl Send for CommitLogger {}
 unsafe impl Sync for CommitLogger {}
 
@@ -490,6 +532,9 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
+            // AsyncCommitLog 的历史命名沿用至今：该值实际是 LogFile 下一次分裂将分配的物理
+            // 文件编号，而非当前可写文件名。当前检查点文件编号通常是返回值减一；分裂失败会
+            // 消耗编号，因此调用方若需要事务的权威归属，应使用 check_point_of。
             logger
                 .0
                 .file
@@ -501,7 +546,8 @@ impl AsyncCommitLog for CommitLogger {
         let logger = self.clone();
 
         async move {
-            //立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
+            // 立即生成新的可写检查点，并把上一个可写检查点标为尚未全部确认。返回值是实际
+            // 新建文件编号，与 current_check_point 的“下一待分配编号”口径不同。
             let _check_pointes_locked = logger.0.check_points.lock().await;
             new_check_point(&logger, false).await
         }.boxed()
@@ -547,8 +593,9 @@ impl AsyncCommitLog for CommitLogger {
 // 原检查点映射和 writable 均保持不变；但底层 commit 的既有 I/O 失败语义不会恢复已经交换
 // 出的内存块，磁盘、文件系统或 runtime 失败后的事务安全不属于本层保证，不能据此重试。
 //
-// commit_pending_block 自身通过独立任务完成内部指针归还和 waiter 唤醒；后续 split 仍沿用
-// LogFile 的既有取消边界。调用方不得在 split 的文件创建 await 中途取消 checkpoint future。
+// commit_pending_block 自身通过独立任务完成内部指针归还和等待者（waiter）唤醒；后续
+// split 仍沿用 LogFile 的既有取消边界。调用方不得在 split 的文件创建 await 中途取消
+// checkpoint future。
 async fn new_check_point(logger: &CommitLogger,
                          is_finish_confirm: bool) -> Result<usize> {
     logger.0.file.commit_pending_block().await?;
@@ -860,6 +907,82 @@ mod checkpoint_rotation_tests {
     const CURRENT_BLOCK_LIMIT: usize = 2 * 1024 * 1024;
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// 这是局部实现分支测试，只验证构建器公开参数的边界归一化；它不代替真实文件系统专项。
+    #[test]
+    fn test_commit_logger_builder_parameter_boundaries() {
+        let rt = MultiTaskRuntimeBuilder::default()
+            .init_worker_size(1)
+            .build();
+        let path = PathBuf::from("unused-builder-boundary-path");
+
+        let defaults = CommitLoggerBuilder::new(rt.clone(), &path);
+        assert_eq!(defaults.path, path);
+        assert_eq!(defaults.log_block_limit, DEFAULT_COMMIT_LOG_BLOCK_SIZE);
+        assert_eq!(defaults.delay_timeout, DEFAULT_DELAY_COMMIT_TIMEOUT);
+        assert_eq!(defaults.log_file_limit, DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT);
+        assert_eq!(defaults.collect_interval, DEFAULT_COMMIT_LOG_COLLECT_INTERVAL);
+
+        for (input, expected) in [
+            (2 * 1024 - 1, DEFAULT_COMMIT_LOG_BLOCK_SIZE),
+            (2 * 1024, 2 * 1024),
+            (32 * 1024 * 1024, 32 * 1024 * 1024),
+            (32 * 1024 * 1024 + 1, DEFAULT_COMMIT_LOG_BLOCK_SIZE),
+        ] {
+            assert_eq!(
+                CommitLoggerBuilder::new(rt.clone(), &path)
+                    .log_block_limit(input)
+                    .log_block_limit,
+                expected,
+                "unexpected block-limit normalization for {input}",
+            );
+        }
+
+        for (input, expected) in [
+            (0, DEFAULT_DELAY_COMMIT_TIMEOUT),
+            (1, 1),
+            (10, 10),
+            (11, DEFAULT_DELAY_COMMIT_TIMEOUT),
+        ] {
+            assert_eq!(
+                CommitLoggerBuilder::new(rt.clone(), &path)
+                    .delay_timeout(input)
+                    .delay_timeout,
+                expected,
+                "unexpected delay-timeout normalization for {input}",
+            );
+        }
+
+        for (input, expected) in [
+            (2 * 1024 * 1024 - 1, DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT),
+            (2 * 1024 * 1024, 2 * 1024 * 1024),
+            (2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
+            (2 * 1024 * 1024 * 1024 + 1, DEFAULT_COMMIT_LOG_FILE_MAX_LIMIT),
+        ] {
+            assert_eq!(
+                CommitLoggerBuilder::new(rt.clone(), &path)
+                    .log_file_limit(input)
+                    .log_file_limit,
+                expected,
+                "unexpected file-limit normalization for {input}",
+            );
+        }
+
+        for (input, expected) in [
+            (5 * 1000 - 1, DEFAULT_COMMIT_LOG_COLLECT_INTERVAL),
+            (5 * 1000, 5 * 1000),
+            (5 * 60 * 1000, 5 * 60 * 1000),
+            (5 * 60 * 1000 + 1, DEFAULT_COMMIT_LOG_COLLECT_INTERVAL),
+        ] {
+            assert_eq!(
+                CommitLoggerBuilder::new(rt.clone(), &path)
+                    .collect_interval(input)
+                    .collect_interval,
+                expected,
+                "unexpected collect-interval normalization for {input}",
+            );
+        }
+    }
+
     #[test]
     fn test_commit_logger_checkpoint_crosses_logfile_limit_once() {
         let _time_loop = startup_global_time_loop(1);
@@ -1022,8 +1145,9 @@ mod checkpoint_rotation_tests {
     }
 
     // 生产修复只允许 CommitLogger 的私有 flush 关闭底层自动分裂；公开 LogFile 路径必须
-    // 保留原有物理阈值语义。同时，重复 flush 已提交句柄不得占住 delay owner，否则下一笔
-    // 未达块阈值的 WAL 只会登记 waiter，而旧句柄定时任务命中已提交快路后无人唤醒它。
+    // 保留原有物理阈值语义。同时，重复刷新已提交句柄不得占住延迟提交所有权（delay
+    // ownership），否则下一笔未达块阈值的 WAL 只会登记等待者（waiter），而旧句柄定时任务
+    // 命中已提交快路后无人唤醒它。
     async fn verify_public_delay_commit_boundary(
         rt: MultiTaskRuntime<()>,
         path: PathBuf,
@@ -1041,14 +1165,14 @@ mod checkpoint_rotation_tests {
         let first_value = vec![0x81; PHYSICAL_FILE_LIMIT + 64 * 1024];
         let first_handle = file.append(LogMethod::PlainAppend, b"first", &first_value);
         if first_handle == 0 {
-            return Err("public LogFile append returned the reserved handle 0".to_owned());
+            return Err("non-empty public LogFile append returned handle 0".to_owned());
         }
         file.delay_commit(first_handle, false, 1)
             .await
             .map_err(|error| format!("public threshold delay commit failed: {error}"))?;
 
-        // delay_commit 的 waiter 在 WAL 写入成功后、owner 完成自动 split 前被唤醒；这里按
-        // 公开既有语义只做有界观察，不能把返回值误当成文件切换的同步屏障。
+        // delay_commit 的等待者（waiter）在 WAL 写入成功后、所有者（owner）完成自动分裂
+        // 前被唤醒；这里按公开既有语义只做有界观察，不能把返回值误当成文件切换的同步屏障。
         let mut new_path = file
             .writable_path()
             .ok_or_else(|| "public threshold split omitted writable path".to_owned())?;
@@ -1082,6 +1206,24 @@ mod checkpoint_rotation_tests {
             .await
             .map_err(|error| format!("repeating committed public handle failed: {error}"))?;
         let second_handle = file.append(LogMethod::PlainAppend, b"second", b"value");
+
+        // `0` 是类型系统可表达但不属于 LogFile 正常协议的输入。它只应命中初始已提交水位并
+        // 幂等返回，绝不能恢复 v0.11.1 的“绕过水位并提交调用时 current”特殊权限。
+        file.delay_commit(0, false, 1)
+            .await
+            .map_err(|error| format!("delaying invalid zero handle failed: {error}"))?;
+        file.commit(0, true, false, None)
+            .await
+            .map_err(|error| format!("committing invalid zero handle failed: {error}"))?;
+        if file.commited_uid() != first_handle || file.writable_size() != 0 {
+            return Err(format!(
+                "zero handle must not commit the successor block: committed={}, expected={}, writable_len={}",
+                file.commited_uid(),
+                first_handle,
+                file.writable_size(),
+            ));
+        }
+
         file.delay_commit(second_handle, false, 10)
             .await
             .map_err(|error| format!("public successor delay commit failed: {error}"))?;
@@ -1098,6 +1240,82 @@ mod checkpoint_rotation_tests {
                 "public successor produced an unexpected split or empty write: writable_len={}, readable={}",
                 file.writable_size(),
                 file.readable_amount(),
+            ));
+        }
+
+        // 公开 commit 的显式分裂标志与大小阈值自动分裂是两条独立语义。这里用一个远低于
+        // 阈值的真实句柄要求同步并分裂：调用返回时旧 writable 必须已经成为第二个 readable，
+        // 新文件必须为空，且提交水位只能推进到第三个真实句柄。
+        let explicit_old_path = file
+            .writable_path()
+            .ok_or_else(|| "public explicit-split fixture lost writable path".to_owned())?;
+        let third_handle = file.append(LogMethod::PlainAppend, b"third", b"explicit-split");
+        file.commit(third_handle, true, true, None)
+            .await
+            .map_err(|error| format!("public explicit-split commit failed: {error}"))?;
+        let explicit_new_path = file
+            .writable_path()
+            .ok_or_else(|| "public explicit split omitted new writable path".to_owned())?;
+        if explicit_new_path == explicit_old_path ||
+            file.readable_amount() != 2 ||
+            file.writable_size() != 0 ||
+            file.commited_uid() != third_handle {
+            return Err(format!(
+                "public explicit split state mismatch: old={explicit_old_path:?}, new={explicit_new_path:?}, readable={}, writable_len={}, committed={}, expected={third_handle}",
+                file.readable_amount(),
+                file.writable_size(),
+                file.commited_uid(),
+            ));
+        }
+        if explicit_old_path
+            .metadata()
+            .map_err(|error| format!("reading explicit-split old WAL failed: {error}"))?
+            .len() == 0 {
+            return Err("public explicit split did not persist its target WAL".to_owned());
+        }
+
+        // `split()` 本身只切换物理文件，不提交 current。先追加第四条、直接 split，再提交该
+        // 真实句柄：被缓冲的数据必须写入 split 后的新文件，证明公开 API 的两步组合边界，
+        // 同时避免把 split 错写成隐式持久化屏障。
+        let buffered_before_split = explicit_new_path;
+        let fourth_handle = file.append(LogMethod::PlainAppend, b"fourth", b"after-raw-split");
+        let raw_split_index = file
+            .split()
+            .await
+            .map_err(|error| format!("public raw split failed: {error}"))?;
+        let buffered_after_split = file
+            .writable_path()
+            .ok_or_else(|| "public raw split omitted new writable path".to_owned())?;
+        let parsed_raw_split_index = buffered_after_split
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(log_file_name_to_usize)
+            .ok_or_else(|| format!("public raw split returned an invalid path: {buffered_after_split:?}"))?;
+        if buffered_after_split == buffered_before_split ||
+            file.readable_amount() != 3 ||
+            file.commited_uid() != third_handle ||
+            parsed_raw_split_index != raw_split_index ||
+            buffered_before_split
+                .metadata()
+                .map_err(|error| format!("reading raw-split old WAL failed: {error}"))?
+                .len() != 0 {
+            return Err(format!(
+                "raw split unexpectedly persisted current: returned={raw_split_index}, old={buffered_before_split:?}, new={buffered_after_split:?}, readable={}, committed={}, expected={third_handle}",
+                file.readable_amount(),
+                file.commited_uid(),
+            ));
+        }
+        file.commit(fourth_handle, true, false, None)
+            .await
+            .map_err(|error| format!("committing after public raw split failed: {error}"))?;
+        if file.commited_uid() != fourth_handle ||
+            file.writable_path().as_ref() != Some(&buffered_after_split) ||
+            file.writable_size() == 0 {
+            return Err(format!(
+                "buffered WAL did not persist to the post-split file: committed={}, expected={fourth_handle}, writable={:?}, expected_path={buffered_after_split:?}, len={}",
+                file.commited_uid(),
+                file.writable_path(),
+                file.writable_size(),
             ));
         }
 

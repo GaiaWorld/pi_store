@@ -1,6 +1,6 @@
 [package]
 name = "pi_store"
-version = "0.11.1"
+version = "0.11.2"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2021"
 description = "File storage"
@@ -22,7 +22,7 @@ pi_async_file = "0.9"
 pi_async_transaction = { version = "~0.12" }
 async-lock = "3.0"
 crossbeam-channel = "0.5"
-dashmap = "6.1"
+dashmap = "6.2"
 url = "2.5"
 async-channel = "2.3"
 pi_guid = "~0.1"
@@ -41,3 +41,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 persy = "1.1"
 lz4 = "~1.25"
 redb = "~2.2"
+
+[[bench]]
+name = "wal_commit_contention"
+harness = false
