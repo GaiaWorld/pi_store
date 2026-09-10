@@ -37,6 +37,21 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
 use pi_async_file::file::{AsyncFileOptions, WriteOptions, AsyncFile, create_dir, rename, remove_file};
 use pi_hash::XHashMap;
 
+#[cfg(feature = "wal-trace")]
+use crate::wal_trace::{self, f, kind, Span, Trace};
+
+#[cfg(feature = "wal-trace")]
+fn notify_sent(span: &mut Span<'_>, failed: bool) {
+    let completed = span.rec().get(f::NOTIFIED).unwrap_or(0) + 1;
+    let failures = span.rec().get(f::SEND_FAILED).unwrap_or(0) + u64::from(failed);
+    span.set(f::NOTIFIED, completed); span.set(f::SEND_FAILED, failures);
+}
+
+#[cfg(feature = "wal-trace")]
+fn notify_end(span: &mut Span<'_>) {
+    if let Some(start) = span.rec().get(f::NOTIFY_START) { let elapsed = span.now().saturating_sub(start); span.set(f::NOTIFY_NS, elapsed); }
+}
+
 /*
 * 默认的日志文件块头长度
 */
@@ -443,6 +458,22 @@ impl LogFile {
         (*lock).1 += 1;
         (*lock).1
     }
+
+    // L04：只观测原四行片段；调用者仍负责检查点锁和 L03 的最终导出。
+    #[cfg(feature = "wal-trace")]
+    pub(crate) fn append_observed(&self, method: LogMethod, key: &[u8], value: &[u8], span: &mut Span<'_>) -> usize {
+        if span.id() == 0 { return self.append(method, key, value); }
+        let start = span.now();
+        let mut lock = self.0.current.lock();
+        let acquired = span.now();
+        (&mut *lock).0.as_mut().unwrap().append(method, key, value);
+        (*lock).1 += 1;
+        let uid = (*lock).1;
+        let end = span.now();
+        span.set(f::CURRENT_WAIT, acquired - start);
+        span.set(f::MEMORY_NS, end - start);
+        uid
+    }
 }
 
 /*
@@ -788,13 +819,54 @@ impl LogFile {
     // commit future 可能跳过指针归还、等待者唤醒和 commited_uid 更新。独立任务即使失去
     // 接收者也会继续完成这些内部收尾，调用方只等待该任务返回的原始写入结果。
     pub(crate) async fn commit_pending_block(&self) -> Result<()> {
+        self.commit_pending_inner(#[cfg(feature = "wal-trace")] None).await
+    }
+
+    pub(crate) async fn commit_pending_inner(&self,
+        #[cfg(feature = "wal-trace")] mut span: Option<&mut Span<'_>>) -> Result<()> {
         let log_uid = {
             let current = self.0.current.lock();
             match (&*current).0.as_ref() {
                 Some(block) if block.len() > 0 => (&*current).1,
-                _ => return Ok(()),
+                _ => {
+                    #[cfg(feature = "wal-trace")]
+                    if let Some(span) = span.as_mut() { span.rec().pending = "empty_skipped"; }
+                    return Ok(());
+                },
             }
         };
+
+        #[cfg(feature = "wal-trace")]
+        if let Some(span) = span.as_mut() {
+            span.set(f::PENDING_UID, log_uid as u64);
+            if span.trace.can_host_helper() {
+                let mut helper = span.trace.helper_trace();
+                let parent = span.id();
+                let (sender, receiver) = async_bounded(1);
+                // 接收端先移入最外层有界暂存；取消时必须在祖先锁之后关闭。
+                let index = span.trace.host_helper(receiver);
+                let log = self.clone();
+                if let Err(e) = self.0.rt.spawn(async move {
+                    let result = log.commit_inner(log_uid, true, false, None, false,
+                        Some((&mut helper, parent, "checkpoint"))).await;
+                    helper.send_helper(sender, result);
+                }) {
+                    span.rec().pending = "spawn_error";
+                    return Err(Error::new(ErrorKind::Other, format!("Commit pending log block failed, path: {:?}, pending_log_uid: {:?}, reason: spawn task failed, detail: {:?}", self.0.path, log_uid, e)));
+                }
+                return match span.trace.receive_helper(index).await {
+                    Ok(packet) => {
+                        span.rec().pending = if packet.result.is_ok() { "commit_ok" } else { "commit_error" };
+                        span.trace.merge_helper(packet)
+                    }
+                    Err(e) => {
+                        span.rec().pending = "result_channel_closed";
+                        Err(Error::new(ErrorKind::Other, format!("Commit pending log block failed, path: {:?}, pending_log_uid: {:?}, reason: result channel closed, detail: {:?}", self.0.path, log_uid, e)))
+                    }
+                };
+            }
+            span.trace.omit(); // 暂存不足：不扩容，不改变原辅助提交，只声明诊断缺口。
+        }
 
         let (sender, receiver) = async_bounded(1);
         let log = self.clone();
@@ -814,7 +886,8 @@ impl LogFile {
                                   true,
                                   false,
                                   None,
-                                  false)
+                                  false,
+                                  #[cfg(feature = "wal-trace")] None)
                     .await;
                 // 通道容量为 1 且只有一个结果；try_send 不会使已完成内部收尾的任务再次等待。
                 // 若维护调用方已被取消，接收端关闭只会丢弃返回值，不会取消上述 commit。
@@ -875,7 +948,8 @@ impl LogFile {
                           is_forcibly,
                           is_split,
                           timeout,
-                          true).await
+                          true,
+                          #[cfg(feature = "wal-trace")] None).await
     }
 
     // commit 的唯一内部实现。is_auto_split_enabled 只控制“达到物理文件大小软限制”分支，
@@ -889,12 +963,28 @@ impl LogFile {
                           is_forcibly: bool,
                           is_split: bool,
                           timeout: Option<usize>,
-                          is_auto_split_enabled: bool) -> Result<()> {
+                          is_auto_split_enabled: bool,
+                          #[cfg(feature = "wal-trace")] context: Option<(&mut Trace, u64, &'static str)>) -> Result<()> {
         let mut commit_block = None;
+        #[cfg(feature = "wal-trace")]
+        let mut disabled = Trace::disabled();
+        #[cfg(feature = "wal-trace")]
+        let (trace, parent, trigger) = context.unwrap_or((&mut disabled, 0, ""));
+        #[cfg(feature = "wal-trace")]
+        let mut span = trace.span(kind::COMMIT, parent, trigger);
+        #[cfg(feature = "wal-trace")]
+        { span.set(f::UID, log_uid as u64); if span.id() != 0 { span.set(f::BEFORE, self.0.commited_uid.load(Ordering::Relaxed) as u64); } span.wait_commit(); }
         let mut mutex = self.0.commit_lock.lock().await; //获取提交锁
+        #[cfg(feature = "wal-trace")]
+        let mut mutex = span.hold(mutex, true, false);
 
-        if log_uid <= self.0.commited_uid.load(Ordering::Relaxed) {
+        let committed = self.0.commited_uid.load(Ordering::Relaxed);
+        #[cfg(feature = "wal-trace")]
+        mutex.span.set(f::AFTER, committed as u64);
+        if log_uid <= committed {
             //指定的日志已提交，则立即返回提交成功，也不需要唤醒任何的等待提交完成的任务
+            #[cfg(feature = "wal-trace")]
+            { mutex.span.rec().outcome = "fast_path"; }
             return Ok(());
         }
 
@@ -902,12 +992,15 @@ impl LogFile {
             //本次提交需要等待，当前正在进行的指定时间后的延迟提交
             if !self.0.delay_commit.load(Ordering::Relaxed) {
                 //等待的当前延迟提交已完成，则继续等待下次延迟提交的返回
+                #[cfg(feature = "wal-trace")]
+                { mutex.span.rec().outcome = "retry_delay_owner_changed"; }
                 drop(mutex); //释放提交锁
                 return self
                     .delay_commit_inner(log_uid,
                                         is_split,
                                         timeout,
-                                        is_auto_split_enabled)
+                                        is_auto_split_enabled,
+                                        #[cfg(feature = "wal-trace")] Some((trace, parent, trigger)))
                     .await;
             }
         }
@@ -925,9 +1018,17 @@ impl LogFile {
                     //当前日志块未达同步大小限制，则等待日志块提交完成
                     let (sender, receiver) = async_bounded(1);
                     (&mut *mutex).push_back(sender);
+                    #[cfg(feature = "wal-trace")]
+                    { mutex.span.rec().outcome = "waiter_registered"; }
                     drop(lock); //释放日志块锁
                     drop(mutex); //释放提交锁
-                    match receiver.recv().await {
+                    #[cfg(feature = "wal-trace")]
+                    { if trace.active() { trace.recv_start = Some(trace.now()); trace.recv_outcome = "cancelled"; } }
+                    let received = receiver.recv().await;
+                    #[cfg(feature = "wal-trace")]
+                    { if let Some(start) = trace.recv_start { trace.recv_ns = Some(trace.now().saturating_sub(start)); }
+                      trace.recv_outcome = match &received { Ok(Ok(())) => "received_ok", Ok(Err(_)) => "received_error", Err(_) => "channel_closed" }; }
+                    match received {
                         Err(e) => {
                             return Err(Error::new(ErrorKind::Other, format!("Commit log failed, path: {:?}, reason: {:?}", self.0.path, e)));
                         },
@@ -949,11 +1050,16 @@ impl LogFile {
             //有需要提交的日志块
             if block.len() == 0 && !is_split {
                 //没有需要提交的日志块且不需要强制分裂，则立即返回成功
-                let waits = (&mut *mutex);
+                #[cfg(feature = "wal-trace")]
+                { mutex.span.stage(3); let targets = mutex.len(); mutex.span.mark(f::NOTIFY_START); mutex.span.set(f::TARGETS, targets as u64); mutex.span.set(f::NOTIFIED, 0); mutex.span.set(f::SEND_FAILED, 0); }
                 //唤醒所有等待提交完成的任务
-                while let Some(sender) = waits.pop_front() {
-                    let _ = sender.send(Ok(())).await;
+                while let Some(sender) = mutex.pop_front() {
+                    let sent = sender.send(Ok(())).await;
+                    #[cfg(feature = "wal-trace")]
+                    notify_sent(&mut mutex.span, sent.is_err());
                 }
+                #[cfg(feature = "wal-trace")]
+                { notify_end(&mut mutex.span); mutex.span.rec().outcome = "empty_owner"; }
 
                 //如果有延迟提交，则设置为无延迟提交
                 let _ = self.0.delay_commit.compare_exchange(true,
@@ -967,18 +1073,39 @@ impl LogFile {
             //写文件
             unsafe {
                 let mut async_file = Box::from_raw(self.0.writable.load(Ordering::Relaxed));
-                match (*async_file).as_mut().unwrap().1.write(0,
+                #[cfg(feature = "wal-trace")]
+                mutex.span.stage(2);
+                #[cfg(feature = "wal-trace")]
+                let mut sync_span = { let attempt = mutex.span.id(); mutex.span.trace.span(kind::SYNC, attempt, trigger) };
+                #[cfg(feature = "wal-trace")]
+                { sync_span.set(f::BYTES, block.len() as u64); sync_span.set(f::MAX_UID, log_uid as u64); sync_span.begin(); }
+                #[cfg(feature = "wal-trace")]
+                let mut polls = 0;
+                #[cfg(not(feature = "wal-trace"))]
+                let written = (*async_file).as_mut().unwrap().1.write(0,
                                                               Arc::from(Vec::from(block)),
-                                                              WriteOptions::Sync(true)).await {
+                                                              WriteOptions::Sync(true)).await;
+                #[cfg(feature = "wal-trace")]
+                let written = wal_trace::observe(&mut polls, (*async_file).as_mut().unwrap().1.write(0,
+                    Arc::from(Vec::from(block)), WriteOptions::Sync(true))).await;
+                #[cfg(feature = "wal-trace")]
+                { sync_span.result(&written); sync_span.set(f::POLLS, polls); if let Ok(len) = &written { sync_span.set(f::WRITTEN, *len as u64); } drop(sync_span); }
+                match written {
                     Err(e) => {
                         //同步日志块失败，则立即返回错误
-                        let waits = (&mut *mutex);
+                        #[cfg(feature = "wal-trace")]
+                        { mutex.span.stage(3); mutex.span.rec().error(&e); mutex.span.rec().outcome = "sync_error";
+                          let targets = mutex.len(); mutex.span.mark(f::NOTIFY_START); mutex.span.set(f::TARGETS, targets as u64); mutex.span.set(f::NOTIFIED, 0); mutex.span.set(f::SEND_FAILED, 0); }
                         //唤醒所有等待同步完成的任务
-                        while let Some(sender) = waits.pop_front() {
-                            let _ = sender
+                        while let Some(sender) = mutex.pop_front() {
+                            let sent = sender
                                 .send(Err(Error::new(ErrorKind::Other, format!("Sync log failed, path: {:?}, reason: {:?}", self.0.path, e))))
                                 .await;
+                            #[cfg(feature = "wal-trace")]
+                            notify_sent(&mut mutex.span, sent.is_err());
                         }
+                        #[cfg(feature = "wal-trace")]
+                        notify_end(&mut mutex.span);
                         Box::into_raw(async_file); //避免被释放
 
                         //如果有延迟提交，则设置为无延迟提交
@@ -991,11 +1118,16 @@ impl LogFile {
                     },
                     Ok(len) => {
                         //提交日志块成功
-                        let waits = (&mut *mutex);
+                        #[cfg(feature = "wal-trace")]
+                        { mutex.span.stage(3); let targets = mutex.len(); mutex.span.mark(f::NOTIFY_START); mutex.span.set(f::TARGETS, targets as u64); mutex.span.set(f::NOTIFIED, 0); mutex.span.set(f::SEND_FAILED, 0); }
                         //唤醒所有等待提交完成的任务
-                        while let Some(sender) = waits.pop_front() {
-                            let _ = sender.send(Ok(())).await;
+                        while let Some(sender) = mutex.pop_front() {
+                            let sent = sender.send(Ok(())).await;
+                            #[cfg(feature = "wal-trace")]
+                            notify_sent(&mut mutex.span, sent.is_err());
                         }
+                        #[cfg(feature = "wal-trace")]
+                        { notify_end(&mut mutex.span); mutex.span.stage(4); }
 
                         if self.0.mutex_status.compare_exchange(false,
                                                                 true,
@@ -1010,6 +1142,8 @@ impl LogFile {
                                                       self.0.log_id.fetch_add(1, Ordering::Relaxed)).await {
                                     Err(e) => {
                                         //追加新的可写日志文件失败，则立即返回错误
+                                        #[cfg(feature = "wal-trace")]
+                                        { mutex.span.rec().error(&e); mutex.span.rec().outcome = "rotate_error"; }
                                         Box::into_raw(async_file); //避免释放可写文件
                                         self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                                         return Err(Error::new(ErrorKind::Other, format!("Append log file failed, path: {:?}, reason: {:?}", self.0.path, e)));
@@ -1046,6 +1180,8 @@ impl LogFile {
                                                      Ordering::Acquire,
                                                      Ordering::Relaxed);
         self.0.commited_uid.store(log_uid, Ordering::Relaxed); //更新已提交完成的日志id
+        #[cfg(feature = "wal-trace")]
+        { mutex.span.rec().outcome = "owner_success"; }
         Ok(())
     }
 
@@ -1066,7 +1202,8 @@ impl LogFile {
                         log_uid: usize,
                         is_split: bool,
                         timeout: usize) -> BoxFuture<Result<()>> {
-        self.delay_commit_inner(log_uid, is_split, timeout, true)
+        self.delay_commit_inner(log_uid, is_split, timeout, true,
+            #[cfg(feature = "wal-trace")] None)
     }
 
     // CommitLogger 必须独占其 checkpoint 到物理文件的映射，不能允许 LogFile 在 flush
@@ -1075,21 +1212,35 @@ impl LogFile {
                                                   log_uid: usize,
                                                   is_split: bool,
                                                   timeout: usize) -> BoxFuture<Result<()>> {
-        self.delay_commit_inner(log_uid, is_split, timeout, false)
+        self.delay_commit_inner(log_uid, is_split, timeout, false,
+            #[cfg(feature = "wal-trace")] None)
+    }
+
+    #[cfg(feature = "wal-trace")]
+    pub(crate) fn delay_commit_observed<'a>(&'a self, log_uid: usize, timeout: usize, trace: &'a mut Trace, parent: u64) -> BoxFuture<'a, Result<()>> {
+        self.delay_commit_inner(log_uid, false, timeout, false, Some((trace, parent, "request")))
     }
 
     // delay_commit 的唯一内部实现。is_auto_split_enabled 必须沿所有者（owner）、等待者
     // （waiter）和定时任务完整传递，避免同一个延迟窗口中的不同分支采用不同的物理文件
     // 轮换策略。
-    fn delay_commit_inner(&self,
+    fn delay_commit_inner<'a>(&'a self,
                           log_uid: usize,
                           is_split: bool,
                           timeout: usize,
-                          is_auto_split_enabled: bool) -> BoxFuture<Result<()>> {
+                          is_auto_split_enabled: bool,
+                          #[cfg(feature = "wal-trace")] context: Option<(&'a mut Trace, u64, &'static str)>) -> BoxFuture<'a, Result<()>> {
         let log = self.clone();
 
         async move {
-            if log_uid <= log.0.commited_uid.load(Ordering::Relaxed) {
+            #[cfg(feature = "wal-trace")]
+            let mut disabled = Trace::disabled();
+            #[cfg(feature = "wal-trace")]
+            let (trace, parent, trigger) = context.unwrap_or((&mut disabled, 0, ""));
+            let entry_fast = log_uid <= log.0.commited_uid.load(Ordering::Relaxed);
+            #[cfg(feature = "wal-trace")]
+            { if trace.flush_fast.is_none() { trace.flush_fast = Some(entry_fast); } }
+            if entry_fast {
                 // checkpoint 维护可能已经代替原 flush 提交了目标句柄。必须在抢占延迟提交
                 // 所有权（delay ownership）和派发定时任务之前短路，否则旧句柄任务会占住
                 // 延迟窗口，使随后追加的日志只登记等待者（waiter），却没有能够刷新它的有效任务。
@@ -1106,14 +1257,29 @@ impl LogFile {
                                   false,
                                   is_split,
                                   Some(timeout),
-                                  is_auto_split_enabled)
+                                  is_auto_split_enabled,
+                                  #[cfg(feature = "wal-trace")] Some((trace, parent, trigger)))
                     .await;
             }
 
             let rt = self.0.rt.clone();
             let log_copy = log.clone();
-            let _ = self.0.rt.spawn(async move {
+            #[cfg(feature = "wal-trace")]
+            let mut timer_trace = trace.child_timer();
+            #[cfg(feature = "wal-trace")]
+            let timer_id = timer_trace.primary_id();
+            #[cfg(feature = "wal-trace")]
+            let mut spawn_span = trace.span(kind::SPAWN, parent, "request");
+            #[cfg(feature = "wal-trace")]
+            { spawn_span.set(f::UID, log_uid as u64); spawn_span.set(f::TIMEOUT, timeout as u64); spawn_span.set(f::TIMER_ID, timer_id); spawn_span.begin(); }
+            let spawned = self.0.rt.spawn(async move {
+                #[cfg(feature = "wal-trace")]
+                let mut timer_span = timer_trace.root();
+                #[cfg(feature = "wal-trace")]
+                { timer_span.set(f::UID, log_uid as u64); timer_span.set(f::PARENT, parent); timer_span.set(f::TIMEOUT, timeout as u64); timer_span.begin(); }
                 rt.timeout(timeout).await; //延迟指定时间
+                #[cfg(feature = "wal-trace")]
+                timer_span.finish("cancelled");
                 log_copy.0.delay_commit.store(false, Ordering::Relaxed); //如果有延迟提交，则设置为无延迟提交
                 // 定时器只能代表创建它的原始 log_uid 批次。若大小提交或 checkpoint 辅助
                 // 提交已经把水位推进到该 id，下面的 commit_inner 必须在交换 current 前
@@ -1122,22 +1288,29 @@ impl LogFile {
                 //
                 // is_auto_split_enabled 只决定本次成功写入后能否按物理文件大小自动分裂，
                 // 不改变定时器的批次身份、等待者唤醒、显式 is_split 或错误传播语义。
-                if let Err(e) = log_copy
+                let committed = log_copy
                     .commit_inner(log_uid,
                                   true,
                                   is_split,
                                   None,
-                                  is_auto_split_enabled)
-                    .await {
+                                  is_auto_split_enabled,
+                                  #[cfg(feature = "wal-trace")] Some((timer_span.trace, timer_id, "timer")))
+                    .await;
+                #[cfg(feature = "wal-trace")]
+                { timer_span.rec().outcome = if committed.is_ok() { "commit_ok" } else { "commit_error" }; if let Err(e) = &committed { timer_span.rec().error(e); timer_span.rec().outcome = "commit_error"; } }
+                if let Err(e) = committed {
                     error!("Delay commit failed, log_uid: {:?}, timeout: {:?}, reason: {:?}", log_uid, timeout, e);
                 }
             });
+            #[cfg(feature = "wal-trace")]
+            { spawn_span.result(&spawned); drop(spawn_span); }
             return log
                 .commit_inner(log_uid,
                               false,
                               is_split,
                               Some(timeout),
-                              is_auto_split_enabled)
+                              is_auto_split_enabled,
+                              #[cfg(feature = "wal-trace")] Some((trace, parent, trigger)))
                 .await;
         }.boxed()
     }
@@ -1153,7 +1326,22 @@ impl LogFile {
     /// 异步创建文件期间保持内部互斥状态，调用方不得在该等待点任意取消，否则不能假定互斥
     /// 状态会自动回滚。
     pub async fn split(&self) -> Result<usize> {
+        self.split_inner(#[cfg(feature = "wal-trace")] None).await
+    }
+
+    pub(crate) async fn split_inner(&self,
+        #[cfg(feature = "wal-trace")] context: Option<(&mut Trace, u64, &'static str)>) -> Result<usize> {
+        #[cfg(feature = "wal-trace")]
+        let mut disabled = Trace::disabled();
+        #[cfg(feature = "wal-trace")]
+        let (trace, parent, trigger) = context.unwrap_or((&mut disabled, 0, ""));
+        #[cfg(feature = "wal-trace")]
+        let mut span = trace.span(kind::SPLIT, parent, trigger);
+        #[cfg(feature = "wal-trace")]
+        span.wait_commit();
         let mut _mutex = self.0.commit_lock.lock().await; //获取提交锁
+        #[cfg(feature = "wal-trace")]
+        let mut _mutex = span.hold(_mutex, true, false);
 
         if self.0.mutex_status.compare_exchange(false,
                                                 true,
@@ -1161,11 +1349,15 @@ impl LogFile {
                                                 Ordering::Relaxed).is_ok() {
             //当前没有整理，则创建新的可写日志文件
             let new_log_index = self.0.log_id.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "wal-trace")]
+            _mutex.span.set(f::NEW_FILE, new_log_index as u64);
             match append_writable(self.0.rt.clone(),
                                   self.0.path.clone(),
                                   new_log_index).await {
                 Err(e) => {
                     //追加新的可写日志文件失败，则立即返回错误
+                    #[cfg(feature = "wal-trace")]
+                    _mutex.span.rec().error(&e);
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
                     Err(Error::new(ErrorKind::Other, format!("Split log file failed, path: {:?}, reason: {:?}", self.0.path, e)))
                 },
@@ -1183,11 +1375,15 @@ impl LogFile {
                     }
                     self.0.mutex_status.store(false, Ordering::Relaxed); //解除互斥操作锁
 
+                    #[cfg(feature = "wal-trace")]
+                    { _mutex.span.rec().outcome = "success"; }
                     Ok(new_log_index)
                 },
             }
         } else {
             //当前有整理与分裂冲突，则立即返回错误
+            #[cfg(feature = "wal-trace")]
+            { _mutex.span.rec().outcome = "collect_conflict"; }
             Err(Error::new(ErrorKind::WouldBlock, format!("Split log file failed, path: {:?}, reason: collect conflict", self.0.path)))
         }
     }
@@ -1215,13 +1411,30 @@ impl LogFile {
 
     //将指定的只读日志文件路径修改为备份的只读日志文件
     pub async fn readable_to_back(&self, readable_path: PathBuf) -> Result<()> {
+        self.readable_to_back_inner(readable_path, #[cfg(feature = "wal-trace")] None).await
+    }
+
+    pub(crate) async fn readable_to_back_inner(&self, readable_path: PathBuf,
+        #[cfg(feature = "wal-trace")] context: Option<(&mut Trace, u64, &'static str)>) -> Result<()> {
+        #[cfg(feature = "wal-trace")]
+        let mut disabled = Trace::disabled();
+        #[cfg(feature = "wal-trace")]
+        let (trace, parent, trigger) = context.unwrap_or((&mut disabled, 0, ""));
+        #[cfg(feature = "wal-trace")]
+        let mut span = trace.span(kind::BACKUP, parent, trigger);
+        #[cfg(feature = "wal-trace")]
+        span.begin();
         let mut back_readable_path = readable_path.clone();
-        if back_readable_path.set_extension(DEFAULT_BAK_LOG_FILE_EXT) {
+        let valid_target = back_readable_path.set_extension(DEFAULT_BAK_LOG_FILE_EXT);
+        let result = if valid_target {
             //设置扩展名成功，则开始修改
             rename(self.0.rt.clone(), readable_path.clone(), back_readable_path.clone()).await
         } else {
             Err(Error::new(ErrorKind::Other, format!("From readable to back readable failed, readable_path: {:?}, back_readable_path: {:?}, reason: set extension error", readable_path, back_readable_path)))
-        }
+        };
+        #[cfg(feature = "wal-trace")]
+        { span.result(&result); span.path(0, readable_path); if valid_target { span.path(1, back_readable_path); } }
+        result
     }
 
     //将所有只读日志文件路径修改为备份的只读日志文件

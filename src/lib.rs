@@ -13,3 +13,7 @@ pub mod log_store;
 pub mod vpm;
 pub mod devices;
 pub mod commit_logger;
+
+/// 本诊断分支默认启用的有界 WAL 跟踪；`--no-default-features` 可构建无采集基线。
+#[cfg(feature = "wal-trace")]
+pub mod wal_trace;

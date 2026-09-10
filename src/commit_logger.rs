@@ -29,6 +29,9 @@ use pi_async_transaction::AsyncCommitLog;
 
 use crate::log_store::log_file::{PairLoader, LogMethod, LogFile, log_file_name_to_usize, PairLoaderExt};
 
+#[cfg(feature = "wal-trace")]
+use crate::wal_trace::{f, kind, Logger as TraceLogger, Span, Trace};
+
 ///
 /// 默认的提交日志的文件大小，为了防止自动生成新的可写文件，所以默认为最大
 ///
@@ -186,6 +189,8 @@ impl CommitLoggerBuilder {
         let confirm_commited_count = AtomicUsize::new(0);
 
         let inner = InnerCommitLogger {
+            #[cfg(feature = "wal-trace")]
+            trace: std::sync::OnceLock::new(),
             rt: rt.clone(),
             file,
             delay_timeout,
@@ -201,6 +206,11 @@ impl CommitLoggerBuilder {
             confirm_commited_count,
         };
         let commit_logger = CommitLogger(Arc::new(inner));
+        #[cfg(feature = "wal-trace")]
+        { let trace = TraceLogger::register(commit_logger.0.file.path(),
+            &commit_logger.0.file.writable_path().unwrap(), rt.get_id(), self.log_block_limit,
+            delay_timeout, log_file_limit, self.collect_interval);
+          let _ = commit_logger.0.trace.set(trace); }
 
         //启动提交日志记录器的定时整理
         let commit_logger_copy = commit_logger.clone();
@@ -232,26 +242,53 @@ pub struct CommitLogger(Arc<InnerCommitLogger>);
 unsafe impl Send for CommitLogger {}
 unsafe impl Sync for CommitLogger {}
 
+#[cfg(feature = "wal-trace")]
+impl CommitLogger {
+    fn trace(&self, kind: usize) -> Trace {
+        Trace::new(self.0.trace.get().unwrap_or(&TraceLogger::default()), kind)
+    }
+}
+
 impl AsyncCommitLog for CommitLogger {
     type C = usize;
     type Cid = Guid;
 
     fn append<B>(&self, commit_uid: Self::Cid, log: B) -> BoxFuture<'static, Result<Self::C>>
         where B: BufMut + AsRef<[u8]> + Send + Sized + 'static {
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::APPEND);
+        #[cfg(feature = "wal-trace")]
+        { let now = trace.now(); if let Some(r) = trace.primary_mut() { r.set(f::START, now); r.set(f::CALL_START, now); r.cid(commit_uid.0); } }
         let logger = self.clone();
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut span = trace.root();
+            #[cfg(feature = "wal-trace")]
+            { span.mark(f::FIRST_POLL); span.set(f::BYTES, log.as_ref().len() as u64); }
             if log.as_ref().len() == 0 {
                 //无效的提交日志，则忽略
+                #[cfg(feature = "wal-trace")]
+                { span.set(f::UID, 0); span.finish("success"); }
                 return Ok(0);
             }
 
+            #[cfg(feature = "wal-trace")]
+            span.mark(f::CHECK_WAIT);
             let mut check_pointes_locked = logger.0.check_points.lock().await;
+            #[cfg(feature = "wal-trace")]
+            { span.mark(f::CHECK_ACQUIRED); span.mark(f::APPEND_START); }
 
             //追加指定的提交日志
+            #[cfg(not(feature = "wal-trace"))]
             let log_handle = logger.0.file.append(LogMethod::PlainAppend,
                                                   commit_uid.0.to_le_bytes().as_ref(),
                                                   log.as_ref());
+            #[cfg(feature = "wal-trace")]
+            let log_handle = logger.0.file.append_observed(LogMethod::PlainAppend,
+                commit_uid.0.to_le_bytes().as_ref(), log.as_ref(), &mut span);
+            #[cfg(feature = "wal-trace")]
+            { span.mark(f::APPEND_END); span.set(f::UID, log_handle as u64); }
 
             //增加已写入当前可写文件的字节数量
             logger.0.writed_size.fetch_add(log.as_ref().len() as u64 + 16, Ordering::Relaxed);
@@ -259,21 +296,37 @@ impl AsyncCommitLog for CommitLogger {
             logger.0.commit_log_count.fetch_add(1, Ordering::Relaxed);
 
             //注册本次事务到检查点表
-            let (counter, path) = &*logger.0.writable.lock();
-            counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
-            check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
+            {
+                let (counter, path) = &*logger.0.writable.lock();
+                counter.fetch_add(1, Ordering::AcqRel); //增加可写检查点未确认事务的计数
+                check_pointes_locked.insert(commit_uid, (counter.clone(), path.clone()));
+                #[cfg(feature = "wal-trace")]
+                { span.mark(f::REGISTER_END); span.shared_path(path.clone()); }
+            }
+            drop(check_pointes_locked);
+            #[cfg(feature = "wal-trace")]
+            span.finish("success");
 
             Ok(log_handle)
         }.boxed()
     }
 
     fn flush(&self, log_handle: Self::C) -> BoxFuture<'static, Result<()>> {
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::FLUSH);
+        #[cfg(feature = "wal-trace")]
+        if let Some(r) = trace.primary_mut() { r.set(f::UID, log_handle as u64); }
         let mut logger = self.clone();
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            { let mut span = trace.root(); span.begin(); let id = span.id();
+              let result = logger.0.file.delay_commit_observed(log_handle, logger.0.delay_timeout, span.trace, id).await;
+              span.result(&result); return result; }
             // CommitLogger 的 checkpoint 是事务到物理 WAL 文件的唯一所有权来源，文件轮换
             // 必须统一由 new_check_point 在 check_points 锁内执行。底层 LogFile 的大小阈值
             // 自动分裂在这里必须关闭，否则可能在上层发布新 checkpoint 前改变物理文件。
+            #[cfg(not(feature = "wal-trace"))]
             logger.0.file.delay_commit_without_auto_split(log_handle,
                                                           false,
                                                           logger.0.delay_timeout).await
@@ -288,77 +341,14 @@ impl AsyncCommitLog for CommitLogger {
         }
 
         let logger = self.clone();
-
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::CONFIRM);
+        #[cfg(feature = "wal-trace")]
+        if let Some(r) = trace.primary_mut() { r.cid(commit_uid.0); r.mode = "normal"; }
         async move {
-            let mut check_pointes_locked = logger.0.check_points.lock().await;
-
-            if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
-                //提交日志的当前可写检查点对应的可写文件，已写入字节数量已达限制
-                //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-                let _ = new_check_point(&logger, false).await;
-            }
-
-            if let Some((counter, check_point_path)) = check_pointes_locked.remove(&commit_uid) {
-                //从检查点表中移除已确认的事务，并减少事务对应检查点的计数
-                logger.0.confirm_commited_count.fetch_add(1, Ordering::Relaxed); //增加确认提交的数量
-
-                if counter.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    //当前已确认事务对应的检查点的计数已清空，则表示事务对应检查点的所有事务已完成确认
-                    if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
-                        //当前已完成确认的检查点是当前可写检查点
-                        //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为已完成确认
-                        let _ = new_check_point(&logger, true).await;
-                    }
-
-                    //整理只读检查点的文件路径列表中已完成确认且可以移除的只读检查点
-                    let mut swap = VecDeque::new();
-                    {
-                        let only_reads = &mut *logger.0.only_reads.lock();
-                        for (path, is_finish_confirm) in only_reads.iter_mut() {
-                            if check_point_path.as_ref() == path {
-                                //当前已完成确认的检查点是只读检查点
-                                *is_finish_confirm = true; //标记只读检查点的状态为已完成确认
-                            } else {
-                                match path.metadata() {
-                                    Err(e) => {
-                                        //获取只读检查点的元信息失败，则记录并继续
-                                        warn!("Confirm commited transaction failed, path: {:?}, reason: {:?}", path, e);
-                                    },
-                                    Ok(meta) => {
-                                        //获取只读检查点的元信息成功
-                                        if meta.len() == 0 {
-                                            // 零长度只读检查点没有登记过需要确认的事务，因此不会有
-                                            // commit_uid 能在未来单独推进它。必须将它视为已完成确认，
-                                            // 否则它会永久阻塞后继 WAL 转为 .bak；下面的队首顺序门禁
-                                            // 仍会阻止它和后继检查点越过更早的非空未确认 WAL。
-                                            *is_finish_confirm = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let mut prev = true; //上一个只读检查点是否已完成确认
-                        while let Some((path, is_finish_confirm)) = only_reads.pop_front() {
-                            if prev && is_finish_confirm {
-                                //上一个只读检查点已完成确认，且当前只读检查点也完成了确认
-                                //则将当前只读检查点的日志文件设置为备份的只读文件，并从只读检查点的文件路径列表中移除
-                                let _ = logger.0.file.readable_to_back(path).await?;
-                            } else if !prev {
-                                //上一个只读检查点未完成确认，则需要等待上一个只读检查点完成确认后，再处理当前只读检查点
-                                swap.push_back((path, is_finish_confirm));
-                            } else {
-                                //当前只读检查点未完成确认，则等待完成确认后再处理
-                                swap.push_back((path, is_finish_confirm));
-                                prev = false; //设置上一个只读检查点未完成确认
-                            }
-                        }
-                    }
-                    *logger.0.only_reads.lock() = swap; //更新只读检查点的文件路径列表
-                }
-            }
-
-            Ok(())
+            confirm_normal(&logger, commit_uid,
+                #[cfg(feature = "wal-trace")] &mut trace,
+                #[cfg(feature = "wal-trace")] None).await
         }.boxed()
     }
 
@@ -366,9 +356,16 @@ impl AsyncCommitLog for CommitLogger {
         where B: BufMut + AsRef<[u8]> + From<Vec<u8>> + Send + Sized + 'static,
               F: Fn(Self::Cid, B) -> Result<()> + Send + Sync + 'static {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::REPLAY);
         let commit_logger = self.clone();
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut span = trace.root();
+            #[cfg(feature = "wal-trace")]
+            { span.rec().mode = "read"; span.begin(); }
+            let result = async {
             if let Some(writable_path) = commit_logger.0.file.writable_path() {
                 //提交日志记录器，当前有可写日志文件
                 match writable_path.metadata() {
@@ -388,7 +385,8 @@ impl AsyncCommitLog for CommitLogger {
 
             //提交日志记录器当前有未确认的提交日志，则开始重播
             //首先强制生成新的可写文件，以保证所有需要重播的提交日志文件都是只读日志文件
-            if let Err(e) = commit_logger.0.file.split().await {
+            if let Err(e) = commit_logger.0.file.split_inner(
+                #[cfg(feature = "wal-trace")] { let id = span.id(); Some((span.trace, id, "replay")) }).await {
                 //强制生成新的可写文件失败，则立即返回错误原因
                 return Err(Error::new(ErrorKind::Other, format!("Replay commit log failed, reason: {:?}", e)));
             }
@@ -444,7 +442,8 @@ impl AsyncCommitLog for CommitLogger {
             for invalid_only_read_path in invalid_only_read_paths {
                 if let Err(e) = commit_logger
                     .0
-                    .file.readable_to_back(invalid_only_read_path.clone())
+                    .file.readable_to_back_inner(invalid_only_read_path.clone(),
+                        #[cfg(feature = "wal-trace")] { let id = span.id(); Some((span.trace, id, "replay_empty_cleanup")) })
                     .await {
                     //将无效的只读日志文件设置为备份的只读日志文件错误，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other, format!("Replay commit log failed, path: {:?}, reason: {:?}", invalid_only_read_path, e)));
@@ -452,6 +451,10 @@ impl AsyncCommitLog for CommitLogger {
             }
 
             loader.result()
+            }.await;
+            #[cfg(feature = "wal-trace")]
+            { span.result(&result); if let Ok((records, bytes)) = &result { span.set(f::RETURN_COUNT, *records as u64); span.set(f::RETURN_BYTES, *bytes as u64); } }
+            result
         }.boxed()
     }
 
@@ -483,28 +486,65 @@ impl AsyncCommitLog for CommitLogger {
 
     fn confirm_replay(&self, commit_uid: Self::Cid) -> BoxFuture<'static, Result<()>> {
         let logger = self.clone();
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::CONFIRM);
+        #[cfg(feature = "wal-trace")]
+        if let Some(r) = trace.primary_mut() { r.cid(commit_uid.0); r.mode = "replay_buffered"; }
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut span = trace.root();
+            #[cfg(feature = "wal-trace")]
+            span.begin();
             //重播时的确认提交日志，不允许直接确认，需要缓冲确认的提交唯一id，并在完成重播时统一确认
             logger.0.replay_confirm_buf.lock().push_back(commit_uid);
+            #[cfg(feature = "wal-trace")]
+            span.finish("success");
             Ok(())
         }.boxed()
     }
 
     fn finish_replay(&self) -> BoxFuture<'static, Result<()>> {
         let logger = self.clone();
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::REPLAY);
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut span = trace.root();
+            #[cfg(feature = "wal-trace")]
+            { span.rec().mode = "finish"; span.begin(); }
+            let result = async {
             //设置为已完成重播
             logger.0.is_replaying.store(false, Ordering::SeqCst);
 
             //执行重播时缓冲的确认提交日志
             let replay_confirms = &mut *logger.0.replay_confirm_buf.lock();
+            #[cfg(feature = "wal-trace")]
+            { span.set(f::BUFFERED, replay_confirms.len() as u64); span.set(f::CONFIRMED, 0); }
             while let Some(commit_uid) = replay_confirms.pop_front() {
+                #[cfg(not(feature = "wal-trace"))]
                 let _ = logger.confirm(commit_uid).await?;
+                #[cfg(feature = "wal-trace")]
+                {
+                    // 原同步入口每次读取模式；不缓存状态，不提前释放重播缓冲锁。
+                    if logger.0.is_replaying.load(Ordering::Relaxed) {
+                        let mut child = span.child(kind::CONFIRM, "", None);
+                        child.rec().mode = "replay_buffered"; child.rec().cid(commit_uid.0); child.begin();
+                        logger.0.replay_confirm_buf.lock().push_back(commit_uid);
+                        child.finish("success");
+                    } else {
+                        let id = span.id(); confirm_normal(&logger, commit_uid, span.trace, Some(id)).await?;
+                    }
+                    let count = span.rec().get(f::CONFIRMED).unwrap_or(0) + 1; span.set(f::CONFIRMED, count);
+                }
             }
 
             Ok(())
+            }.await;
+            #[cfg(feature = "wal-trace")]
+            span.result(&result);
+            result
         }.boxed()
     }
 
@@ -544,12 +584,17 @@ impl AsyncCommitLog for CommitLogger {
 
     fn append_check_point(&self) -> BoxFuture<'static, Result<usize>> {
         let logger = self.clone();
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::MAINTENANCE);
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut parent = trace.root();
             // 立即生成新的可写检查点，并把上一个可写检查点标为尚未全部确认。返回值是实际
             // 新建文件编号，与 current_check_point 的“下一待分配编号”口径不同。
             let _check_pointes_locked = logger.0.check_points.lock().await;
-            new_check_point(&logger, false).await
+            new_check_point_inner(&logger, false,
+                #[cfg(feature = "wal-trace")] Some((&mut parent, "explicit_append_checkpoint"))).await
         }.boxed()
     }
 
@@ -598,8 +643,36 @@ impl AsyncCommitLog for CommitLogger {
 // checkpoint future。
 async fn new_check_point(logger: &CommitLogger,
                          is_finish_confirm: bool) -> Result<usize> {
-    logger.0.file.commit_pending_block().await?;
-    let log_index = logger.0.file.split().await?; //当前块已落入旧检查点后，才允许生成新的可写文件
+    new_check_point_inner(logger, is_finish_confirm,
+        #[cfg(feature = "wal-trace")] None).await
+}
+
+async fn new_check_point_inner(logger: &CommitLogger, is_finish_confirm: bool,
+    #[cfg(feature = "wal-trace")] parent: Option<(&mut Span<'_>, &'static str)>) -> Result<usize> {
+    #[cfg(feature = "wal-trace")]
+    let mut disabled = Trace::disabled();
+    #[cfg(feature = "wal-trace")]
+    let mut span = match parent {
+        Some((parent, trigger)) => { let link = if parent.rec().get(f::ROTATION1).is_none() { f::ROTATION1 } else { f::ROTATION2 }; parent.child(kind::ROTATE, trigger, Some(link)) }
+        None => disabled.span(kind::ROTATE, 0, ""),
+    };
+    #[cfg(feature = "wal-trace")]
+    { span.set(f::MARK_OLD, u64::from(is_finish_confirm)); span.rec().stage = "pending_commit"; span.begin(); }
+    let pending = logger.0.file.commit_pending_inner(
+        #[cfg(feature = "wal-trace")] Some(&mut span)).await;
+    #[cfg(feature = "wal-trace")]
+    { if let Some(start) = span.rec().get(f::START) { let elapsed = span.now().saturating_sub(start); span.set(f::PENDING_NS, elapsed); }
+      if pending.is_err() { span.result(&pending); } }
+    pending?;
+    #[cfg(feature = "wal-trace")]
+    { span.rec().stage = "split"; }
+    let split = logger.0.file.split_inner(
+        #[cfg(feature = "wal-trace")] { let id = span.id(); Some((span.trace, id, "checkpoint")) }).await;
+    #[cfg(feature = "wal-trace")]
+    if split.is_err() { span.result(&split); }
+    let log_index = split?; //当前块已落入旧检查点后，才允许生成新的可写文件
+    #[cfg(feature = "wal-trace")]
+    { span.set(f::NEW_FILE, log_index as u64); span.rec().stage = "publish_checkpoint"; }
 
     //设置新的可写检查点
     let check_point_counter = Arc::new(AtomicU64::new(0)); //初始化可写检查点的计数器
@@ -608,12 +681,79 @@ async fn new_check_point(logger: &CommitLogger,
 
     //将上一个可写检查点的日志文件追加到只读检查点的文件路径列表，等待这个检查点的所有事务的提交确认
     let only_read_path = logger.0.file.last_readable_path();
+    #[cfg(feature = "wal-trace")]
+    if let Some(index) = only_read_path.file_name().and_then(|n| n.to_str()).and_then(|n| n.split('.').next()).and_then(|n| n.parse::<u64>().ok()) { span.set(f::OLD_FILE, index); }
     logger.0.only_reads.lock().push_back((only_read_path, is_finish_confirm));
 
     //重置新的可写日志文件的已写入字节数量
     logger.0.writed_size.store(0, Ordering::Relaxed);
 
+    #[cfg(feature = "wal-trace")]
+    span.finish("success");
     Ok(log_index)
+}
+
+// 与原 confirm 共用唯一业务体。诊断上下文显式借用，重播调用不会绕过祖先暂存区。
+async fn confirm_normal(logger: &CommitLogger, commit_uid: Guid,
+    #[cfg(feature = "wal-trace")] trace: &mut Trace,
+    #[cfg(feature = "wal-trace")] parent: Option<u64>) -> Result<()> {
+    #[cfg(feature = "wal-trace")]
+    let mut span = match parent { Some(id) => trace.span(kind::CONFIRM, id, ""), None => trace.root() };
+    #[cfg(feature = "wal-trace")]
+    { span.rec().cid(commit_uid.0); span.rec().mode = "normal"; span.begin(); }
+    let mut check_pointes_locked = logger.0.check_points.lock().await;
+    #[cfg(feature = "wal-trace")]
+    let mut check_pointes_locked = span.hold(check_pointes_locked, false, true);
+
+    if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
+        // 原语义：容量轮换先于 CID 查找，轮换错误不改变 confirm 的返回值。
+        let _ = new_check_point_inner(logger, false,
+            #[cfg(feature = "wal-trace")] Some((&mut check_pointes_locked.span, "confirm_size_limit"))).await;
+    }
+    let registration = check_pointes_locked.remove(&commit_uid);
+    #[cfg(feature = "wal-trace")]
+    check_pointes_locked.span.set(f::FOUND, u64::from(registration.is_some()));
+    if let Some((counter, check_point_path)) = registration {
+        logger.0.confirm_commited_count.fetch_add(1, Ordering::Relaxed);
+        let pending = counter.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "wal-trace")]
+        { check_pointes_locked.span.set(f::PENDING_COUNT, pending); check_pointes_locked.span.shared_path(check_point_path.clone()); }
+        if pending == 1 {
+            if check_point_path.as_ref() == logger.0.writable.lock().1.as_ref() {
+                let _ = new_check_point_inner(logger, true,
+                    #[cfg(feature = "wal-trace")] Some((&mut check_pointes_locked.span, "confirm_checkpoint_drained"))).await;
+            }
+            let mut swap = VecDeque::new();
+            {
+                let only_reads = &mut *logger.0.only_reads.lock();
+                for (path, is_finish_confirm) in only_reads.iter_mut() {
+                    if check_point_path.as_ref() == path { *is_finish_confirm = true; }
+                    else { match path.metadata() {
+                        Err(e) => warn!("Confirm commited transaction failed, path: {:?}, reason: {:?}", path, e),
+                        Ok(meta) => {
+                            // 空检查点没有 CID 推进确认；仍须服从下面的队首顺序门禁。
+                            if meta.len() == 0 { *is_finish_confirm = true; }
+                        }
+                    } }
+                }
+                let mut prev = true;
+                while let Some((path, is_finish_confirm)) = only_reads.pop_front() {
+                    if prev && is_finish_confirm {
+                        let result = logger.0.file.readable_to_back_inner(path,
+                            #[cfg(feature = "wal-trace")] { let id = check_pointes_locked.span.id(); Some((check_pointes_locked.span.trace, id, "confirm_cleanup")) }).await;
+                        #[cfg(feature = "wal-trace")]
+                        if let Err(e) = &result { check_pointes_locked.span.rec().error(e); }
+                        result?;
+                    } else if !prev { swap.push_back((path, is_finish_confirm)); }
+                    else { swap.push_back((path, is_finish_confirm)); prev = false; }
+                }
+            }
+            *logger.0.only_reads.lock() = swap;
+        }
+    }
+    #[cfg(feature = "wal-trace")]
+    { check_pointes_locked.span.rec().outcome = "success"; }
+    Ok(())
 }
 
 // 整理提交日志记录器，在重播时不允许整理
@@ -626,6 +766,10 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
         return;
     }
 
+    #[cfg(feature = "wal-trace")]
+    let mut trace = logger.trace(kind::MAINTENANCE);
+    #[cfg(feature = "wal-trace")]
+    let mut parent = trace.root();
     //获取检查点表的异步锁
     let check_pointes_locked = logger.0.check_points.lock().await;
 
@@ -633,7 +777,8 @@ async fn collect_commit_logger(logger: &CommitLogger, timeout: usize) {
     if logger.0.writed_size.load(Ordering::Relaxed) >= logger.0.log_file_limit {
         //提交日志的当前可写检查点对应的可写文件，已写入字节数量已达限制
         //则立即强制生成新的可写检查点，并设置上一个可写检查点的状态为未完成确认
-        new_check_point(&logger, false).await;
+        new_check_point_inner(&logger, false,
+            #[cfg(feature = "wal-trace")] Some((&mut parent, "background_size_limit"))).await;
     }
 
     drop(check_pointes_locked); //立即释放检查点表的异步锁
@@ -646,9 +791,16 @@ impl CommitLoggerExt for CommitLogger {
           F: Fn(Option<(Self::Cid, LogMethod, u64, B)>) -> Result<()> + Send + Sync + 'static
     {
         self.0.is_replaying.store(true, Ordering::SeqCst); //设置为正在重播
+        #[cfg(feature = "wal-trace")]
+        let mut trace = self.trace(kind::REPLAY);
         let commit_logger = self.clone();
 
         async move {
+            #[cfg(feature = "wal-trace")]
+            let mut span = trace.root();
+            #[cfg(feature = "wal-trace")]
+            { span.rec().mode = "read_ext"; span.begin(); }
+            let result = async {
             if let Some(writable_path) = commit_logger.0.file.writable_path() {
                 //提交日志记录器，当前有可写日志文件
                 match writable_path.metadata() {
@@ -671,7 +823,8 @@ impl CommitLoggerExt for CommitLogger {
 
             //提交日志记录器当前有未确认的提交日志，则开始重播
             //首先强制生成新的可写文件，以保证所有需要重播的提交日志文件都是只读日志文件
-            if let Err(e) = commit_logger.0.file.split().await {
+            if let Err(e) = commit_logger.0.file.split_inner(
+                #[cfg(feature = "wal-trace")] { let id = span.id(); Some((span.trace, id, "replay_ext")) }).await {
                 //强制生成新的可写文件失败，则立即返回错误原因
                 return Err(Error::new(ErrorKind::Other,
                                       format!("Replay commit log failed, reason: {:?}",
@@ -732,7 +885,8 @@ impl CommitLoggerExt for CommitLogger {
             for invalid_only_read_path in invalid_only_read_paths {
                 if let Err(e) = commit_logger
                     .0
-                    .file.readable_to_back(invalid_only_read_path.clone())
+                    .file.readable_to_back_inner(invalid_only_read_path.clone(),
+                        #[cfg(feature = "wal-trace")] { let id = span.id(); Some((span.trace, id, "replay_ext_empty_cleanup")) })
                     .await {
                     //将无效的只读日志文件设置为备份的只读日志文件错误，则立即返回错误原因
                     return Err(Error::new(ErrorKind::Other,
@@ -743,12 +897,18 @@ impl CommitLoggerExt for CommitLogger {
             }
 
             loader.result()
+            }.await;
+            #[cfg(feature = "wal-trace")]
+            { span.result(&result); if let Ok((records, bytes)) = &result { span.set(f::RETURN_COUNT, *records as u64); span.set(f::RETURN_BYTES, *bytes as u64); } }
+            result
         }.boxed()
     }
 }
 
 // 基于日志文件的内部提交日志记录器
 struct InnerCommitLogger {
+    #[cfg(feature = "wal-trace")]
+    trace:                  std::sync::OnceLock<TraceLogger>,
     rt:                     MultiTaskRuntime<()>,                                   //异步运行时
     file:                   LogFile,                                                //日志文件
     delay_timeout:          usize,                                                  //延迟刷新提交日志的时间，单位毫秒
@@ -1340,6 +1500,8 @@ mod checkpoint_rotation_tests {
         let check_point_counter = Arc::new(TestAtomicU64::new(0));
 
         Ok(CommitLogger(Arc::new(InnerCommitLogger {
+            #[cfg(feature = "wal-trace")]
+            trace: std::sync::OnceLock::new(),
             rt,
             file,
             delay_timeout: 1,
